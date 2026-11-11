@@ -521,6 +521,108 @@ pub fn pick_pool_bot() -> Option<Value> {
     None
 }
 
+/// What the pool can ACTUALLY stream right now, not what its rows claim.
+///
+/// A `bot_pool` row says `"status": "online"` because that is what was written the
+/// day the bot was added; it survives restarts and flood waits untouched, so
+/// counting it always reports a fully healthy pool while playback fails. The two
+/// tests that decide whether a stream can go through a bot are the ones
+/// [`pick_pool_bot()`] applies: a session file on THIS instance, and no cooldown
+/// left. Bounded by the pool size (20 bots = 20 stats + 20 cache reads), so it is
+/// safe to call on a dashboard poll.
+pub fn pool_health() -> Value {
+    summarise_pool(&get_bot_pool(), now(), crate::telegram::has_session_file, flood_remaining_for)
+}
+
+/// Pure core of [`pool_health`]: `has_session` and `flood_for` are injected so the
+/// rules can be tested without a `storage/sessions/` tree or a cache.
+pub fn summarise_pool(
+    pool: &[Value],
+    ts: i64,
+    has_session: impl Fn(&str) -> bool,
+    flood_for: impl Fn(&str) -> i64,
+) -> Value {
+    let active = get_bot_id();
+    let mut total = 0usize;
+    let mut ready = 0usize;
+    let mut flooded = 0usize;
+    let mut no_session = 0usize;
+    let mut flood_seconds = 0i64;
+    let mut active_ready = false;
+    for b in pool {
+        let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        total += 1;
+        let cooldown = b.get("cooldown_until").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wait = flood_for(id).max(cooldown - ts).max(0);
+        if wait > 0 {
+            flooded += 1;
+            flood_seconds = flood_seconds.max(wait);
+        }
+        let has = has_session(id);
+        if !has {
+            no_session += 1;
+        }
+        if has && wait == 0 {
+            ready += 1;
+            if !active.is_empty() && id == active {
+                active_ready = true;
+            }
+        }
+    }
+    serde_json::json!({
+        "total": total,
+        "ready": ready,
+        "flooded": flooded,
+        "no_session": no_session,
+        "flood_seconds": flood_seconds,
+        "active_ready": active_ready,
+    })
+}
+
+#[cfg(test)]
+mod pool_health_tests {
+    use super::*;
+
+    /// The pool is healthiest-looking exactly when it is least useful: every row
+    /// says "online", while two of the four cannot stream. Only `ready` may count.
+    #[test]
+    fn ready_counts_only_bots_that_can_stream_now() {
+        let ts = 1_000;
+        let pool = vec![
+            serde_json::json!({"bot_id": "a", "status": "online", "cooldown_until": 0}),
+            serde_json::json!({"bot_id": "b", "status": "online", "cooldown_until": 2_000}),
+            serde_json::json!({"bot_id": "c", "status": "online", "cooldown_until": 0}),
+            // A flood that lives in the cache rather than in the row.
+            serde_json::json!({"bot_id": "d", "status": "online", "cooldown_until": 0}),
+            // No id: not a bot, must not pad the total either.
+            serde_json::json!({"bot_id": "", "status": "online"}),
+        ];
+        let h = summarise_pool(
+            &pool,
+            ts,
+            |id| id != "c", // "c" has no session file on this instance
+            |id| if id == "d" { 300 } else { 0 },
+        );
+        assert_eq!(h["total"], 4);
+        assert_eq!(h["ready"], 1, "only 'a' has a session and no wait");
+        assert_eq!(h["flooded"], 2, "'b' by cooldown_until, 'd' by the cache");
+        assert_eq!(h["no_session"], 1);
+        assert_eq!(h["flood_seconds"], 1_000, "cooldown 2000 - now 1000 beats the 300");
+    }
+
+    /// An empty pool is all zeros, never a panic or a fabricated 1/1.
+    #[test]
+    fn an_empty_pool_reports_zeroes() {
+        let h = summarise_pool(&[], 1_000, |_| true, |_| 0);
+        assert_eq!(h["total"], 0);
+        assert_eq!(h["ready"], 0);
+        assert_eq!(h["active_ready"], false);
+    }
+}
+
 /// Exactly ONE guest bot is leased per instance — no more, and there is **no
 /// knob** to raise it.
 ///
@@ -591,6 +693,28 @@ pub fn note_flood_for(bot_id: &str, error: &str) -> i64 {
     if secs <= 0 {
         return 0;
     }
+    note_flood_seconds(id, secs, error)
+}
+
+/// Record a flood wait whose seconds are ALREADY KNOWN — a `GramErr.flood_wait`
+/// — instead of parsing them back out of a message.
+///
+/// MEASURED 2026-11-09 from the live log: `upload.getFile` answered `FLOOD_WAIT
+/// (420)` on bots whose LOGIN was perfectly healthy, and nothing recorded it —
+/// only the sign-in path called `note_flood_for`. So `usable()` kept offering
+/// those bots, every resolve picked them again, the payload bound them, and the
+/// fleet answered `429 RATE_LIMITED` to BitChord, VLC, Chrome and libmpv alike
+/// (21 refusals in 20 seconds) — which is what "the app will not play lossless"
+/// looks like from the client side.
+///
+/// Recording it here makes the flood behave like the login flood it already is:
+/// that bot is skipped for the duration, the next resolve picks a healthy one,
+/// and the client's own retry lands somewhere that works.
+pub fn note_flood_seconds(bot_id: &str, secs: i64, why: &str) -> i64 {
+    let id = bot_id.trim();
+    if id.is_empty() || secs <= 0 {
+        return 0;
+    }
     if secs <= flood_remaining_for(id) {
         return secs;
     }
@@ -599,10 +723,10 @@ pub fn note_flood_for(bot_id: &str, error: &str) -> i64 {
         "seconds": secs,
         "recorded_at": now(),
         "bot_id": id,
-        "error": error,
+        "error": why,
     });
     crate::cache::put(FLOOD_NS, &format!("bot:{}", id), &body, secs, secs);
-    log("telegram login flood wait recorded (per bot)", &body);
+    log("telegram flood wait recorded (per bot)", &body);
     secs
 }
 
@@ -1518,6 +1642,9 @@ pub async fn auto_provision_guest(
     // in pool bots it did not add itself, and one expired token must not take the
     // whole pool down.
     let mut env_err: Option<String> = None;
+    // Every bot id this instance is configured with, so the block below can tell
+    // "this token is bad" from "Telegram is rate-limiting the whole fleet".
+    let mut env_ids: Vec<String> = Vec::new();
     for token in env_bot_tokens() {
         let id_part = token.split(':').next().unwrap_or("").trim().to_string();
         let target = if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
@@ -1525,6 +1652,7 @@ pub async fn auto_provision_guest(
         } else {
             format!("env_{}", random_suffix())
         };
+        env_ids.push(target.clone());
         match tg.boot(&target, Some(&token)).await {
             Ok(entry) => {
                 remember_env_identity(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
@@ -1560,7 +1688,35 @@ pub async fn auto_provision_guest(
     // fresh `auth.ImportBotAuthorization` — the measured shape of the 55-minute
     // lockout (10 dynos x 7 env bots logging in at boot). A deploy with tokens
     // either signs one of them in or reports why it could not.
-    if !env_bot_tokens().is_empty() {
+    //
+    // UNLESS THE REASON IS A RATE LIMIT.
+    //
+    // That refusal is right for a bad token and wrong for a flood wait, and the
+    // difference is not academic — MEASURED 2026-11-09 on the live fleet, after a
+    // deploy that restarted five dynos at once:
+    //
+    //   env bot token failed to boot {"bot_id":"8469916399","error":"bot sign-in
+    //     paused: Telegram rate limit for this bot for another 684s (FLOOD_WAIT)"}
+    //   guest bot lease skipped: BOT_TOKENS supplies the pool {"env_bots":6, ...}
+    //
+    // Six bots, all waiting on Telegram, no guest lease allowed: the instance had
+    // ZERO usable bots and every stream stopped — music and video alike, because
+    // both need a logged-in bot before a single byte moves. Refusing a *temporary*
+    // condition with a permanent answer is the bug; the guest pool exists exactly
+    // for this, and one lease is one call to the origin's own pool rather than six
+    // logins, so it cannot repeat the storm it is there to survive.
+    let all_rate_limited = !env_ids.is_empty()
+        && env_ids.iter().all(|id| flood_remaining_for(id) > 0);
+    if all_rate_limited {
+        log(
+            "every BOT_TOKENS bot is rate-limited - leasing a guest bot instead",
+            &serde_json::json!({
+                "bots": env_ids.len(),
+                "wait_s": env_ids.iter().map(|id| flood_remaining_for(id)).max().unwrap_or(0),
+            }),
+        );
+    }
+    if !env_bot_tokens().is_empty() && !all_rate_limited {
         let env_bots = env_bot_tokens().len();
         log(
             "guest bot lease skipped: BOT_TOKENS supplies the pool",

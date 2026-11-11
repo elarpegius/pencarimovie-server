@@ -4,8 +4,9 @@
 //! PHP one-for-one, and the ORDER is the PHP's:
 //! `/api/sub-proxy` -> `/api/auth/*` -> `/api/version` -> `/api/lan-ip` ->
 //! `/api/tunnel/*` -> `/api/catalog-settings` -> `/api/media-ids` ->
-//! `/api/validate-manifest` -> `/api/country` -> `/api/session` ->
-//! `/api/clock-check` -> `/api/provision` -> `/api/bots*` -> [version gate] ->
+//! `/api/validate-manifest` -> `/api/music-sources/test` -> `/api/country` ->
+//! `/api/session` -> `/api/clock-check` -> `/api/provision` -> `/api/bots*` ->
+//! [version gate] ->
 //! `/api/diagnostics*` -> `/api/reports` -> `/api/debug-mode` -> `/api/logs` ->
 //! `/api/botlogin` -> `/api/botlogout` -> `/api/proxy-stream` -> `/api/download`
 //! -> `/api/resolve-shortcode` -> `/api/warmup-resolve` -> manifest/catalog/meta/
@@ -47,7 +48,7 @@ use crate::resolve::{
     resolve_shortcode, resolve_shortcode_concurrent, warmup_resolve_batch,
 };
 use crate::respond::{
-    allow_private_network, eclipse_locked_response, json_response, not_found_json, redirect, rtrim,
+    allow_private_network, music_locked, json_response, not_found_json, redirect, rtrim,
     stremio_json, stremio_locked_stream, text_response,
 };
 use crate::session::{
@@ -69,6 +70,44 @@ fn jstr(v: &Value, key: &str) -> String {
 fn header_json(req: &Request<Body>) -> HashMap<String, String> {
     let _ = req;
     HashMap::new()
+}
+
+/// The `/api/diagnostics` body.
+///
+/// `activity` is what the Android app polls every 3 s to decide whether it is
+/// "Active" (hold the wake/Wi-Fi lock, say so in the notification) or "Idle" —
+/// the TDLib app's markActive / ACTIVE_LOCK_TIMEOUT_MS behaviour — so its keys
+/// may be added but never renamed or retyped.
+fn diagnostics_payload(reports: Vec<Value>) -> Value {
+    let streams = crate::download::active_streams();
+    let preflights = crate::download::active_preflights();
+    serde_json::json!({
+        "ok": 1,
+        "info": device_info(),
+        "counts": diag_counts(),
+        "activity": {
+            "streams": streams,
+            "preflights": preflights,
+            "total": streams + preflights,
+            "titles": crate::download::active_titles(),
+            "online": crate::ratelimit::online_count(crate::ratelimit::ONLINE_WINDOW_S),
+            "cpu_percent": crate::diagnostics::cpu_percent_now(),
+            "refused_429": crate::download::refused_429(),
+        },
+        // The REST origin is not a catalog source, it is the whole app: catalogs,
+        // meta, stream lists, `resolve-file`, provisioning and trending all come from
+        // it, so it gets its own object and its real host rather than being called a
+        // "catalog" that happens to be down. `down_s` is the fail-fast gate every
+        // WordPress call arms; `resolve_cooldown_s` is the same outage seen from the
+        // resolve layer. `0` means healthy in both. Atomics / one cache read, so this
+        // is free on a 3 s poll.
+        "origin": {
+            "host": crate::config::wp_api_host(),
+            "down_s": crate::httpc::wp_origin_down_secs(),
+            "resolve_cooldown_s": crate::resolve::resolve_cooldown_remaining_sec(),
+        },
+        "reports": reports,
+    })
 }
 
 pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
@@ -571,6 +610,19 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 current["upstream_manifests"] = Value::Array(cleaned);
             }
         }
+        // Music upstreams: validated structurally before anything is written. The
+        // NETWORK check is `/api/music-sources/test` (the dashboard's Test
+        // button); this path only refuses a row that can never work, and refuses
+        // the WHOLE save rather than dropping it — "Saved!" while quietly
+        // discarding an entry is how a URL typo becomes a mystery a week later.
+        if let Some(list) = input.get("music_sources").and_then(|v| v.as_array()) {
+            match clean_music_sources(list) {
+                Ok(cleaned) => current["music_sources"] = Value::Array(cleaned),
+                Err(why) => {
+                    return json_response(400, &serde_json::json!({"ok": 0, "error": why}))
+                }
+            }
+        }
         if let Some(sc_in) = input.get("stream_config").and_then(|v| v.as_object()) {
             if current.get("stream_config").map(|v| v.is_object()).unwrap_or(false) == false {
                 current["stream_config"] = serde_json::json!({});
@@ -743,6 +795,33 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         );
     }
 
+    /* ── music upstreams (the fill source a backfill fetches masters from) ─── */
+    if p == "/api/music-sources/test" && m == "POST" {
+        // SECURITY — this route makes the SERVER fetch a URL the caller typed, so
+        // it must not be reachable from the internet: same gate as `/api/provision`
+        // (loopback or the token). `music_upstreams::probe` refuses a host that
+        // does not resolve to a PUBLIC address on top of that, which is what stops
+        // a form here from being used to poke at the LAN or at loopback.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
+        let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let url = jstr(&input, "url");
+        if url.is_empty() {
+            return json_response(
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "reason": "Enter the addon base URL first.",
+                }),
+            );
+        }
+        // ALWAYS 200: the answer is a report the dashboard renders inline, and a
+        // 4xx/5xx here would read as "the server failed" rather than "this addon
+        // cannot be used". `ok` is the field to branch on.
+        return json_response(200, &crate::music_upstreams::probe(&url).await);
+    }
+
     /* ── country (backend.php:18755-18802) ────────────────────────────────── */
     if p == "/api/country" && m == "GET" {
         let settings = read_catalog_settings();
@@ -824,6 +903,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 // the identities stay with the operator.
                 "bot_count": if auth_privileged(&ctx) { pool.len() } else { 0 },
                 "bot_pool": if auth_privileged(&ctx) { pool } else { Vec::<Value>::new() },
+                // Pool rows carry the "online" they were written with, so the count
+                // above says nothing about what can stream NOW. This is the same
+                // question `pick_pool_bot()` answers, in one small object.
+                "bot_pool_health": if auth_privileged(&ctx) {
+                    crate::session::pool_health()
+                } else {
+                    Value::Null
+                },
                 "environment_ok": true,
                 "environment_fatal": false,
                 "environment_problems": [],
@@ -1163,26 +1250,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         }
         let mut reports = diag_list();
         reports.truncate(10);
-        // `activity` is what the Android app polls to decide whether it is
-        // "Active" (hold the wake/Wi-Fi lock, say so in the notification) or
-        // "Idle" (release them after a grace period) — the TDLib app's
-        // markActive/ACTIVE_LOCK_TIMEOUT_MS behaviour.
-        let streams = crate::download::active_streams();
-        let preflights = crate::download::active_preflights();
-        return json_response(
-            200,
-            &serde_json::json!({
-                "ok": 1,
-                "info": device_info(),
-                "counts": diag_counts(),
-                "activity": {
-                    "streams": streams,
-                    "preflights": preflights,
-                    "total": streams + preflights,
-                },
-                "reports": reports,
-            }),
-        );
+        return json_response(200, &diagnostics_payload(reports));
     }
 
     if p == "/api/diagnostics/settings" {
@@ -1465,6 +1533,16 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     if addon_path.is_empty() {
         addon_path = "/manifest.json".to_string();
     }
+    // Player polls only: a `/stream` body never re-enters this function per
+    // chunk, and `/catalog` + `/meta` are fetched once per screen.
+    if addon_path.starts_with("/stream/")
+        || addon_path.starts_with("/catalog/")
+        || addon_path.starts_with("/meta/")
+    {
+        if let Some(key) = crate::ratelimit::client_id(&ctx) {
+            crate::ratelimit::note_seen(&key);
+        }
+    }
     if addon_path == "/manifest.json" {
         // `ETag` + `max-age=1800, stale-while-revalidate=3600`, 304 on a matching
         // `If-None-Match` — the PHP's descriptor response (backend.php:15468-15488).
@@ -1530,7 +1608,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     };
     if p.starts_with("/eclipse") {
         if !is_authenticated(&ctx) {
-            return eclipse_locked_response(&ctx.base_url);
+            return music_locked(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {
             // A UNIVERSAL music addon, not an Eclipse-branded one: the id no
@@ -1539,10 +1617,23 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // the alias every already-installed addon URL uses.
             //
             // The descriptor itself is pinned to backend.php:14315-14346: same
-            // `types`, the `latest` catalog row and the `quality` setting, since
-            // clients render their catalog list and Settings sheet straight from
-            // it. The icon stays the SHIPPED logo (the PHP points at a WordPress
-            // upload; operator choice here is to never depend on that host).
+            // `types` and the `latest` catalog row, since clients render their
+            // catalog list straight from it. The icon stays the SHIPPED logo (the
+            // PHP points at a WordPress upload; operator choice here is to never
+            // depend on that host).
+            //
+            // NO `settings` block, and that is a deletion with a reason: this
+            // engine serves the ONE rendition Telegram holds for a short code, so
+            // a quality picker could not change what plays. Eclipse only shows a
+            // settings cog for addons that list "settings" in `resources` (we do
+            // not), but BitChord renders a picker for any `key: "quality"` — a
+            // listener would pick "Normal Quality" and get the original file.
+            //
+            // The same document is the BitChord manifest: `id`, `name`,
+            // `version` and `resources` are all it requires, and "search" is in
+            // `resources`. It only lacks `bitchordAuth`, which would claim this
+            // server verifies BitChord's hardware-backed proof; without it the
+            // addon works and BitChord just labels the source "outdated".
             return stremio_json(
                 200,
                 &serde_json::json!({
@@ -1556,17 +1647,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                     "icon": format!("{}/logo.png", rtrim(&ctx.base_url)),
                     "catalogs": [
                         {"id": "latest", "type": "track", "name": "Latest Telegram Tracks"}
-                    ],
-                    "settings": [{
-                        "key": "quality",
-                        "type": "select",
-                        "label": "Audio quality",
-                        "default": "high",
-                        "options": [
-                            {"value": "high", "label": "Original / High Quality"},
-                            {"value": "normal", "label": "Normal Quality"}
-                        ]
-                    }]
+                    ]
                 }),
                 "max-age=3600",
             );
@@ -1576,7 +1657,87 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 let a = ctx.qs("q");
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
-            let tracks = eclipse_search(&q, 30).await;
+            let rows = music_search(&q, 30).await;
+            // A song the catalogue holds no LOSSLESS copy of is what the backfill
+            // EXISTS for — and the trigger is now the CATALOGUE, not the client's
+            // request.
+            //
+            // The old condition also required `quality=lossless` from the caller.
+            // That is wrong for a hi-res catalogue: `eclipse::tier()` can only say
+            // `LOSSLESS` or `HIGH` (there is no hi-res-versus-CD-lossless field to
+            // read), so "this song has no hi-res lossless" can only be answered by
+            // "this song has no lossless row at all" — and a client browsing
+            // without asking for lossless would never have triggered it.
+            //
+            // Nothing is awaited here: the client gets its answer immediately from
+            // what the catalogue holds, and the fill happens in the background so
+            // the NEXT request for this song has a real lossless row. Deduped per
+            // query (10 min, `spawn_for_query`) and per recording (the ledger's
+            // edition + title keys), so a browse burst cannot queue the same upload
+            // ten times. The empty query is excluded because a blank search would
+            // ask the source for nothing and could fill an unrelated recording.
+            // HI-RES, not merely "lossless".
+            //
+            // MEASURED 2026-11-07: `Guns N' Roses Sweet Child O' Mine` answered
+            // with 30 rows and never triggered, because a `LOSSLESS` row already
+            // existed — a CD copy. `eclipse::tier()` cannot tell a 16/44.1 FLAC
+            // from a 24/96 master (both read `LOSSLESS`); bitrate can, and
+            // `format_track()` now emits `size` for exactly this test.
+            // LAZY: fill only what was ASKED FOR and is genuinely absent.
+            //
+            // "No hi-res row" is NOT a reason to fill when the caller asked for
+            // plain lossless and a good 16/44.1 FLAC is already in the catalogue —
+            // that spends a source search plus a 20–45 MB upload on something
+            // nobody asked for. MEASURED 2026-11-09: ordinary `quality=LOSSLESS`
+            // browsing produced 19 fills inside one minute, every one of them
+            // while the client already had a lossless row to play.
+            //
+            // medium/low/unpublished never fill: a fill uploads a MASTER, so it can
+            // never be the thing those tiers were missing. `tier_satisfied` holds
+            // that rule, and its test names it.
+            if !q.trim().is_empty() && !tier_satisfied(&rows, &ctx.qs("quality")) {
+                // A pool pick, not the primary bot: uploads are rate-limited per
+                // ACCOUNT, and a fleet all uploading through one bot floods
+                // (`upload.saveBigFilePart` 420). See `upload_bot`.
+                let bot = upload_bot();
+                // Logged BEFORE anything can fail: a trigger that leaves no trail
+                // is indistinguishable from a trigger that never ran, which is
+                // exactly the confusion this line removes. `asked` records what the
+                // client requested, so a fill on a non-lossless browse is visible
+                // as such rather than looking like a stray upload.
+                log(
+                    "backfill: catalogue has no hi-res lossless",
+                    &serde_json::json!({
+                        "q": q,
+                        "rows": rows.len(),
+                        "asked": ctx.qs("quality"),
+                        "bot": bot,
+                    }),
+                );
+                if bot.is_empty() {
+                    log("backfill: no bot session, cannot fill", &serde_json::json!({"q": q}));
+                } else {
+                    // The client is resolved INSIDE the task: a freshly booted
+                    // server has not necessarily put the bot in the pool yet, and a
+                    // search arriving in that window must still schedule the fill.
+                    let st = state.clone();
+                    let query = q.clone();
+                    tokio::spawn(async move {
+                        let entry = match st.telegram.get(&bot).await {
+                            Some(e) => Some(e),
+                            None => st.telegram.boot(&bot, None).await.ok(),
+                        };
+                        match entry {
+                            Some(e) => crate::backfill::spawn_for_query(&query, e.pick()),
+                            None => log(
+                                "backfill: bot could not be booted",
+                                &serde_json::json!({"q": query, "bot_id": bot}),
+                            ),
+                        }
+                    });
+                }
+            }
+            let tracks = rank_for_tier(local_artwork(&ctx.base_url, rows), &ctx.qs("quality"));
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/catalog/") {
@@ -1584,16 +1745,96 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // origin indexes tracks, not rows, so "latest" is a plain search.
             let cat = rest.trim_end_matches(".json").trim();
             let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = eclipse_search(q, 50).await;
+            let tracks = local_artwork(&ctx.base_url, music_search(q, 50).await);
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
-            return eclipse_stream(&ctx, rest.trim_end_matches(".json")).await;
+            return music_stream(&ctx, rest.trim_end_matches(".json")).await;
         }
         if let Some(rest) = p.strip_prefix("/eclipse/play/") {
-            return eclipse_stream(&ctx, rest.trim_end_matches(".json")).await;
+            return music_stream(&ctx, rest.trim_end_matches(".json")).await;
         }
         return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
+    }
+
+    /* ── /api/backfill ────────────────────────────────────────────────────── */
+    // POST {track_id, title, artist, duration} → fetch that master from the
+    // hi-res source, send it to a relay account, and answer with the handle that
+    // plays it back. Deliberately synchronous: an operator wants the reason when
+    // it refuses (already indexed, no usable relay, source down), and a 25 MB
+    // upload is a one-off, not a hot path.
+    if p == "/api/backfill" && m == "POST" {
+        if let Some(resp) = require_trusted_device(&ctx) {
+            return resp;
+        }
+        let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let param = |name: &str| -> String {
+            let q = ctx.qs(name);
+            if !q.is_empty() {
+                return q.trim().to_string();
+            }
+            body.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let track_id = param("track_id");
+        if track_id.is_empty() || !track_id.chars().all(|c| c.is_ascii_digit()) {
+            return json_response(
+                400,
+                &serde_json::json!({"ok": 0, "error": "track_id must be the source's numeric id"}),
+            );
+        }
+        // A pool pick, not the primary bot — the upload budget is per account.
+        let bot = upload_bot();
+        if bot.is_empty() {
+            return json_response(
+                503,
+                &serde_json::json!({"ok": 0, "error": "no bot session — a send needs a logged-in bot"}),
+            );
+        }
+        let entry = match state.telegram.get(&bot).await {
+            Some(e) => e,
+            None => match state.telegram.boot(&bot, None).await {
+                Ok(e) => e,
+                Err(e) => {
+                    return json_response(
+                        503,
+                        &serde_json::json!({"ok": 0, "error": format!("bot boot: {e}")}),
+                    )
+                }
+            },
+        };
+        let client = entry.pick();
+        let duration = body
+            .get("duration")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        return match crate::backfill::backfill(
+            &client,
+            &track_id,
+            &param("title"),
+            &param("artist"),
+            duration,
+            &param("relay"),
+            &param("artwork"),
+        )
+        .await
+        {
+            Ok(b) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "file_name": b.file_name,
+                    "size": b.size,
+                    "message_id": b.message_id,
+                    "dc_id": b.target.dc_id,
+                    "playable": true,
+                }),
+            ),
+            Err(e) => json_response(409, &serde_json::json!({"ok": 0, "error": e})),
+        }
     }
 
     /* ── /api/resolve-shortcode, /api/warmup-resolve ──────────────────────── */
@@ -2081,16 +2322,8 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             let b = jstr(&resolved, "bot_id");
             if b.is_empty() { active_bot.clone() } else { b }
         };
-        let payload = serde_json::json!({
-            "file_id_mt": file_id,
-            "file_size": size,
-            "file_name": file_name,
-            "mime": mime,
-            "short_code": code,
-            "bot_id": bot_for_payload,
-        });
-        let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-        let url = build_stream_url(&ctx.base_url, &b64, &file_name);
+        let payload = stream_payload(&code, &file_name, &mime, size, &file_id, &bot_for_payload);
+        let url = stream_url(&ctx.base_url, &payload, &file_name);
         // A direct `pm_file_` item keeps its file_id in the payload (no
         // resolution at download time) and still gets the sponsored message on
         // top, exactly like every other stream list.
@@ -2424,6 +2657,7 @@ fn add_episode_files(
     season: i32,
     episode: i32,
     names: &[String],
+    siblings: &[String],
     max: usize,
 ) {
     let series_title = if title.trim().is_empty() { keyword } else { title };
@@ -2443,7 +2677,7 @@ fn add_episode_files(
         if !crate::matcher::file_matches_episode(parsed, season, episode) {
             continue;
         }
-        if !crate::matcher::series_file_matches_title(
+        if !crate::matcher::series_file_matches_title_with_siblings(
             &f.title,
             series_title,
             season,
@@ -2451,6 +2685,7 @@ fn add_episode_files(
             year,
             &f.caption,
             names,
+            siblings,
         ) {
             continue;
         }
@@ -2621,6 +2856,18 @@ async fn resolve_episode_files_with(
             upstream::episode_names(&settings, imdb_id, season, episode, &title, &year).await
         }
     };
+    // The OTHER episodes' titles, for the `$add()` guard below. They make the
+    // guard stricter (a file naming a different known episode is rejected) and
+    // stop it from rejecting a file that is merely named in the uploader's own
+    // ordering — see `episode_subtitle_matches_with_siblings()`.
+    let sibling_names_future = async {
+        if imdb_id.trim().is_empty() {
+            Vec::new()
+        } else {
+            let settings = load_catalog_settings_merged();
+            upstream::sibling_episode_names(&settings, imdb_id, season, episode, &title, &year).await
+        }
+    };
     let post_files_future = async {
         if has_post {
             crate::wp_data::fetch_post_files_paged(post_id, 200, 600, 3).await
@@ -2647,8 +2894,9 @@ async fn resolve_episode_files_with(
             None
         }
     };
-    let (episode_names, post_files, more) = tokio::join!(
+    let (episode_names, sibling_names, post_files, more) = tokio::join!(
         episode_names_future,
+        sibling_names_future,
         post_files_future,
         episode_index_future,
     );
@@ -2667,6 +2915,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         log(
@@ -2702,6 +2951,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         log(
@@ -2746,6 +2996,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         if all.len() > before {
@@ -2809,6 +3060,7 @@ async fn resolve_episode_files_with(
                     season,
                     episode,
                     &episode_names,
+                    &sibling_names,
                     MAX_FILES,
                 );
             }
@@ -2852,7 +3104,7 @@ async fn handle_external_stream(
     item_id: &str,
     upstream: Option<tokio::task::JoinHandle<Vec<Value>>>,
 ) -> Option<Response> {
-    let (prefix, value, season, episode) = parse_external_id(item_id)?;
+    let (prefix, value, mut season, mut episode) = parse_external_id(item_id)?;
     // LOCAL IDENTITY MEMORY, before ANY origin call (`ext_meta_<id>.json`,
     // backend.php:3062). A hit replaces both the `media_ids_idx` index read and
     // the upstream meta call, so an id this server already self-discovered opens
@@ -3024,7 +3276,15 @@ async fn handle_external_stream(
         // nothing to search and the item answered "No Streams Found". Measured
         // on a real phone: tt6751668, tt21952924, tt34809853, tt34991493.
         let settings = load_catalog_settings_merged();
-        if let Some(body) = upstream::forward_meta(&settings, item_type, item_id).await {
+        // The addon is asked for the BARE id. A meta endpoint does not know the
+        // `:S:E` suffix: measured on the live origin,
+        // `/meta/series/tt10603444.json` answers 200 with the whole series while
+        // `/meta/series/tt10603444:1:1.json` answers **404** — and because this
+        // call used the raw `item_id`, every series whose id was not already in
+        // `media_ids_idx` resolved to "no title" and answered "No Streams
+        // Found" for every episode (reported for "Oswald the Lucky Rabbit").
+        let bare_meta_id = crate::upstream::strip_episode_suffix(item_id);
+        if let Some(body) = upstream::forward_meta(&settings, item_type, &bare_meta_id).await {
             let meta = body.get("meta").cloned().unwrap_or(Value::Null);
             let name = jstr(&meta, "name");
             if !name.is_empty() {
@@ -3063,6 +3323,60 @@ async fn handle_external_stream(
                         &imdb_for_write,
                         if kind == "series" { "tvseries" } else { "movie" },
                     );
+                }
+            }
+        }
+    }
+
+    // An ITEM that IS a season numbers its episodes from 1. AIOMetadata publishes
+    // Black Clover season 2 as `kitsu:50024` (13 videos, ids `kitsu:50024:1..13`)
+    // and the origin files those as `S02E01..S02E13`, so read literally its
+    // episode 2 is S01E02 and the list showed the FIRST season under a season-2
+    // episode ("it show season 1"). Two sources, in order:
+    //
+    //   1. the item's OWN video entry, whose `season` field says it belongs to
+    //      season 2 (the meta's `name` is just "Black Clover" for both ids, so
+    //      only the video entry can tell them apart);
+    //   2. a season marker in the resolved title ("… Season 2").
+    //
+    // The trailing number of a 3-segment episode-numbered id is the ABSOLUTE
+    // episode, and the addon's own video entry knows where it belongs:
+    // `kitsu:11:84` is Naruto S03E01, `kitsu:11:132` is S04E01, `kitsu:50024:2` is
+    // Black Clover S02E02. Only the season was adopted before, so the episode
+    // number stayed 84 and the search asked for S03E84 — an episode that cannot
+    // exist (season 3 has 48) — and the item answered "No Streams Found"
+    // (`kitsu:11:84`, `:132`, `:180` in the log).
+    if is_episode_numbered_prefix(prefix)
+        && item_id.split(':').count() == 3
+        && (item_type.contains("series") || season > 0 || episode > 0)
+        && episode > 0
+    {
+        let bare_media = format!("{}:{}", prefix, value);
+        let settings = load_catalog_settings_merged();
+        match upstream::episode_item_position(&settings, &bare_media, item_id, &title, &year).await {
+            Some((s, e)) => {
+                log(
+                    "stream: episode position adopted from the addon video entry",
+                    &serde_json::json!({
+                        "item_id": item_id, "title": title, "season": s, "episode": e,
+                        "requested_episode": episode,
+                    }),
+                );
+                season = s;
+                episode = e;
+            }
+            None => {
+                // No video entry for this id: fall back to a season marker in the
+                // title (an item that IS one season, numbered from 1).
+                if season <= 1 {
+                    let named = crate::matcher::season_from_title(&title);
+                    if named > 1 {
+                        log(
+                            "stream: season adopted from the title",
+                            &serde_json::json!({"item_id": item_id, "title": title, "season": named}),
+                        );
+                        season = named;
+                    }
                 }
             }
         }
@@ -3140,7 +3454,8 @@ async fn handle_external_stream(
     // episode's other releases (another group's copy, other qualities). The PHP
     // enters that ladder with postId 0 on this branch (backend.php:17093), which
     // is exactly what `resolve_external_episode_files()` is for.
-    let (eff_season, eff_episode) = effective_season_episode(kind == "series", season, episode);
+    let (mut eff_season, mut eff_episode) =
+        effective_season_episode(kind == "series", season, episode);
     if kind == "series" {
         let r = resolve_external_episode_files(
             item_id,
@@ -3155,6 +3470,56 @@ async fn handle_external_stream(
         title = r.title;
         year = r.year;
         files = r.files;
+
+        // ABSOLUTE-NUMBERING FALLBACK.
+        //
+        // Long-running shows are uploaded as one continuous run
+        // (`Naruto.E84.mkv` — no season marker) while the addon splits them into
+        // theTVDB seasons (Naruto: S1 35, S2 48, S3 48 …), so S03E01 is absolute
+        // episode 84. Read literally, S03E01 matches nothing and every season
+        // past the first answered "No Streams Found" with all 220 episodes
+        // sitting in the origin.
+        //
+        // Only runs when the season-relative pass found NOTHING, so a show that
+        // really is laid out per season costs nothing and cannot be widened.
+        if files.is_empty() && eff_season > 1 {
+            let settings = load_catalog_settings_merged();
+            let absolute = upstream::absolute_episode(
+                &settings,
+                &episode_media_id,
+                eff_season,
+                eff_episode,
+                &title,
+                &year,
+            )
+            .await;
+            if absolute > 0 && absolute != eff_episode {
+                log(
+                    "stream: retrying with an absolute episode number",
+                    &serde_json::json!({
+                        "item_id": item_id, "season": eff_season, "episode": eff_episode,
+                        "absolute": absolute, "title": title,
+                    }),
+                );
+                let r2 = resolve_external_episode_files(
+                    item_id,
+                    &title,
+                    &year,
+                    &episode_media_id,
+                    1,
+                    absolute,
+                    Vec::new(),
+                )
+                .await;
+                if !r2.files.is_empty() {
+                    title = r2.title;
+                    year = r2.year;
+                    files = r2.files;
+                    eff_season = 1;
+                    eff_episode = absolute;
+                }
+            }
+        }
     }
 
     Some(
@@ -3230,6 +3595,18 @@ fn origin_resolves_by_id(prefix: &str) -> bool {
     prefix == "imdb" || prefix == "tmdb"
 }
 
+/// Providers whose addon ids are EPISODE-numbered: one trailing number is the
+/// EPISODE (season 1), not the season.
+///
+/// AIOMetadata answers `kitsu:13209` with 170 videos whose ids are
+/// `kitsu:13209:1` … `kitsu:13209:170` — the whole show in season 1 — so a
+/// client click on episode 16 arrives as `kitsu:13209:16`. `tt` / `tmdb` /
+/// `tvdb` / `tvmaze` are season-based and keep the Stremio `id:season:episode`
+/// reading for a two-number tail.
+fn is_episode_numbered_prefix(prefix: &str) -> bool {
+    matches!(prefix, "kitsu" | "mal" | "anilist" | "anidb")
+}
+
 /// The id an origin probe may send: BARE. Never the item id — it carries the
 /// `:S:E` suffix, which the origin rejects outright — `imdb` already holds
 /// `tt0944947`, a bare `tt…` value is accepted as-is by the origin, and every
@@ -3271,8 +3648,27 @@ fn parse_external_id(item_id: &str) -> Option<(&'static str, String, i32, i32)> 
             if value.is_empty() {
                 return None;
             }
-            let season: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let episode: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let first = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let second = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let (season, episode) = match (first, second) {
+                // `kitsu:13209:1:16` — the Stremio `id:season:episode` shape.
+                (Some(s), Some(e)) => (s, e),
+                // ONE trailing number. For an EPISODE-numbered provider that is
+                // the EPISODE, not the season: AIOMetadata publishes Black Clover
+                // as `kitsu:13209:1` … `:170` (all season 1), so a client click on
+                // episode 16 arrives as `kitsu:13209:16`. Reading it as season 16
+                // sent the search to S16E1, matched nothing, and every episode of
+                // the show answered "No Streams Found" (measured in the log:
+                // `kitsu:13209:16` and `kitsu:13209:43`, both `matched:0`).
+                (Some(n), None) => {
+                    if is_episode_numbered_prefix(name) && n > 0 {
+                        (1, n)
+                    } else {
+                        (n, 0)
+                    }
+                }
+                (None, _) => (0, 0),
+            };
             return Some((name, value, season, episode));
         }
     }
@@ -3904,21 +4300,82 @@ fn no_streams_card(
     }
     // The keyword comes from the TITLE, falling back to the item id. The link
     // points at the keyword search on the CURRENT origin, not at the sponsor.
-    let keyword = if !title.trim().is_empty() {
-        title.trim().to_string()
-    } else {
-        item_id.to_string()
+    //
+    // The title here is a WordPress post title, decoration and all
+    // (`"Kudrat 1968: High Council 2026 • Movie"`). The search page on
+    // pencarimovie.com matches keywords literally, so the `• Movie` tail — the
+    // one part no filename ever carries — turned a real hit into "no stream
+    // found". Only the type decoration is dropped; a year INSIDE the title
+    // ("Kudrat 1968") stays, because it is part of the name.
+    let keyword = {
+        let raw = if !title.trim().is_empty() {
+            title.trim().to_string()
+        } else {
+            item_id.to_string()
+        };
+        let cleaned = clean_post_title(&raw);
+        if cleaned.is_empty() {
+            raw
+        } else {
+            cleaned
+        }
     };
-    let base = ctx.base_url.trim_end_matches('/');
     serde_json::json!({
         "name": "No Streams Found",
         "description": "⚠️ No streams available for this title.",
         "externalUrl": format!(
             "https://pencarimovie.com/search/{}?ddldomain={}",
             urlencode_component(&keyword),
-            urlencode_component(base)
+            urlencode_component(&ddl_domain_value(&ctx.base_url))
         ),
     })
+}
+
+/// The `ddldomain` handed to pencarimovie.com's fallback search.
+///
+/// Loopback is the one origin that needs no credential: this machine is
+/// `auth_privileged()`, so `http://127.0.0.1:8088/api/download` answers. Every
+/// other origin (LAN IP, tunnel hostname, custom domain) is `is_local_request()`'s
+/// remote branch and must carry the server token, or the fallback page's
+/// `/api/version` probe and every `/api/download` click answer 401 and the page
+/// looks empty — the exact "on streams list no stream found" report for a title
+/// that played fine from `127.0.0.1`.
+///
+/// The token goes in the PATH (`https://host:port/<token>`), the same transport
+/// [`strip_token_prefix()`] and the WP plugin understand; a token is never put
+/// in a query string here because the value ends up in the cookie jar verbatim.
+fn ddl_domain_value(base_url: &str) -> String {
+    let base = rtrim(base_url);
+    if !auth_enabled() {
+        return base;
+    }
+    let host = url::Url::parse(&base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    if host_is_loopback(&host) {
+        return base;
+    }
+    let token = auth_token();
+    if token.is_empty() {
+        return base;
+    }
+    format!("{}/{}", base, urlencode_component(&token))
+}
+
+/// `localhost`, `127.0.0.0/8` and `::1` — never any other name or address.
+/// Suffixed `.localhost` names (a browser resolves them to loopback) are included.
+fn host_is_loopback(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.is_empty() {
+        return false;
+    }
+    let h = h.to_ascii_lowercase();
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h == "::1"
+        || h == "0:0:0:0:0:0:0:1"
+        || h.starts_with("127.")
 }
 
 /// The sponsored message from `GET {WP_API_BASE}/version` (`sponsor.{name,
@@ -4096,14 +4553,30 @@ fn stream_item(
         )),
     );
 
-    let payload = serde_json::json!({
-        "file_size": size,
-        "file_name": file_name,
-        "mime": mime,
-        "short_code": short_code,
-    });
-    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-    let url = build_stream_url(&ctx.base_url, &b64, &file_name);
+    // The same id a movie stream already had, taken from the resolve cache the
+    // two calls above (`cached_duration`, `cached_part`) read anyway. Without it
+    // every Range on a catalog row re-entered `/resolve-file`; with it the
+    // download path reuses the id and only re-resolves when the reference is
+    // stale, which it already detects.
+    let (payload_id, payload_bot) = {
+        let bot = get_bot_id();
+        let cached = if short_code.is_empty() || bot.is_empty() {
+            None
+        } else {
+            crate::resolve::resolve_shortcode_cached(&short_code, &bot)
+        };
+        match cached {
+            Some(c) => {
+                let a = jstr(&c, "file_id_mt");
+                let id = if a.is_empty() { jstr(&c, "file_id") } else { a };
+                let b = jstr(&c, "bot_id");
+                (id, if b.is_empty() { bot } else { b })
+            }
+            None => (String::new(), String::new()),
+        }
+    };
+    let payload = stream_payload(&short_code, &file_name, &mime, size, &payload_id, &payload_bot);
+    let url = stream_url(&ctx.base_url, &payload, &file_name);
     // NO `title`. stremio-core (web AND Android) parses a stream into
     // `{ name, description, url|externalUrl|infoHash, behaviorHints }` — `title`
     // is not part of that model, and a row carrying it was dropped while the
@@ -4317,6 +4790,51 @@ async fn handle_thumb_api(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // 404, never a 5xx: an `<img>` treats 5xx as retryable and hammers it.
         None => not_found_json(),
     }
+}
+
+/// The ONE payload a `/api/download` stream URL carries, for movies and music
+/// alike.
+///
+/// MEASURED 2026-11-09 from the live log, and the drift was invisible until then:
+/// the external/movie path carried `file_id_mt` + `bot_id`, so every Range there
+/// logged `"file_id_present":true` and never re-resolved, while the catalog and
+/// music paths left them out and every Range went back through `/resolve-file`.
+/// Same endpoint, same body — so one builder is the only way they stay the same.
+///
+/// `file_id_mt` and `bot_id` are omitted ONLY when there is no id; they always
+/// travel together, because the `file_reference` inside a file id belongs to the
+/// bot that minted it (`handle_download` will not rotate bots for a request that
+/// already carries one).
+fn stream_payload(
+    short_code: &str,
+    file_name: &str,
+    mime: &str,
+    file_size: u64,
+    file_id_mt: &str,
+    bot_id: &str,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "file_size": file_size,
+        "file_name": file_name,
+        "mime": mime,
+        "short_code": short_code,
+    });
+    let id = file_id_mt.trim();
+    let bot = bot_id.trim();
+    if !id.is_empty() && !bot.is_empty() {
+        payload["file_id_mt"] = serde_json::json!(id);
+        payload["bot_id"] = serde_json::json!(bot);
+        // The name `/api/download` also accepts directly, so the payload has one
+        // shape whatever produced it.
+        payload["file_id"] = serde_json::json!(id);
+    }
+    payload
+}
+
+/// The `/api/download` URL for a payload — one encoder, one call shape.
+fn stream_url(base_url: &str, payload: &Value, file_name: &str) -> String {
+    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
+    build_stream_url(base_url, &b64, file_name)
 }
 
 fn build_stream_url(base_url: &str, payload_b64: &str, file_name: &str) -> String {
@@ -4617,6 +5135,16 @@ fn default_catalog_settings() -> Value {
         // the single master switch; the stored list is kept when it is off, so
         // turning it back on restores everything without re-adding URLs.
         "upstream_manifests": upstream::default_manifests(),
+        // Operator-managed music upstreams: the addons `backfill` fills a missing
+        // track from. Each entry is `{id, name, url, enabled}`, and it is ALWAYS a
+        // list (never null) so the dashboard can `forEach` it on a fresh install.
+        //
+        // Starts EMPTY on purpose. A default host in the binary is a default
+        // somebody else's server pays for — the same rule the `PM_HIRES_BASE`
+        // doc comment in [`crate::backfill`] records, measured 2026-11-10 when a
+        // compiled-in default spent a request on every search of an install that
+        // had never configured a source.
+        "music_sources": [],
         "stream_config": {
             "resolutions": {"4k": true, "1080p": true, "720p": true, "sd": true, "unknown": true},
             "qualities": {"remux": true, "bluray": true, "webdl": true, "webrip": true, "hdtv": true, "cam": true},
@@ -4638,7 +5166,13 @@ fn default_catalog_settings() -> Value {
 
 /// Stored settings merged over the defaults (one level deep for `stream_config`,
 /// so a file written before a key existed still gains it).
-fn load_catalog_settings_merged() -> Value {
+///
+/// `music_sources` is merged like any other key: an EMPTY stored list means the
+/// operator removed every upstream, and that must stay empty. (It is the one list
+/// in this document where empty is a real answer — `upstream_manifests` keeps its
+/// built-in defaults because those are the app's own catalogs; a music source is
+/// always somebody's explicit choice.)
+pub(crate) fn load_catalog_settings_merged() -> Value {
     let mut base = default_catalog_settings();
     let stored = read_catalog_settings();
     let Some(stored_obj) = stored.as_object() else {
@@ -4736,6 +5270,43 @@ fn write_catalog_settings(data: &Value) -> bool {
             false
         }
     }
+}
+
+/// The dashboard's "Music upstreams" rows, cleaned into what gets written.
+///
+/// Each row becomes `{id, name, url, enabled}` with `url` NORMALISED (see
+/// [`crate::music_upstreams::normalize_base`]) so a pasted `…/manifest.json` and
+/// the bare base are the same source. The same base twice is one row: a duplicate
+/// would spend the same request twice on every fill.
+fn clean_music_sources(list: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = Vec::new();
+    for row in list {
+        let raw = row.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let url = crate::music_upstreams::normalize_base(raw)
+            .map_err(|why| format!("music source \"{raw}\": {why}"))?;
+        if out.iter().any(|seen| jstr(seen, "url") == url) {
+            continue;
+        }
+        let id = match row.get("id").and_then(|v| v.as_str()).map(|s| s.trim()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => crate::music_upstreams::source_id(&url),
+        };
+        let name = {
+            let n = row.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if n.is_empty() { url.clone() } else { n.to_string() }
+        };
+        let enabled = row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        out.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "url": url,
+            "enabled": enabled,
+        }));
+    }
+    Ok(out)
 }
 
 /// `fd_get_default_catalog_options()` (backend.php:11743) — an **id → info map**,
@@ -7107,7 +7678,7 @@ const MUSIC_STALE_GRACE: i64 = 21_600;
 /// Observed live with the origin failing: `search-music` returned `rows:0` on every
 /// query, so the music browser showed nothing at all — while `/stream` on the same
 /// origin still answered from its stale copy. That asymmetry is what this fixes.
-async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
+async fn music_search(query: &str, limit: usize) -> Vec<Value> {
     // Key WITHOUT the cache-buster: same query + limit = same answer.
     let key = format!("{}|{}", limit, query.trim().to_ascii_lowercase());
     let q_owned = query.to_string();
@@ -7176,7 +7747,7 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
             let tracks: Vec<Value> = rows
                 .iter()
                 .filter(|r| !str_at(r, "short_code").is_empty())
-                .map(crate::eclipse::format_track)
+                .map(crate::music::format_track)
                 .collect();
             // The ORIGIN'S ORDER IS THE RANKING — do not re-sort here.
             //
@@ -7207,7 +7778,6 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
 
     let tracks: Vec<Value> = body.as_array().cloned().unwrap_or_default();
     if !tracks.is_empty() {
-        music_prewarm(&tracks);
         return tracks;
     }
     // Same stale fallback the stream path has: a known album beats a blank screen.
@@ -7218,55 +7788,73 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
                     "music search served stale",
                     &serde_json::json!({"q": query, "tracks": arr.len()}),
                 );
-                let out = arr.clone();
-                music_prewarm(&out);
-                return out;
+                return arr.clone();
             }
         }
     }
     tracks
 }
 
-/// How many of a search's top tracks to warm.
+/// Music prewarm used to live here. Deleted on measurement, not taste.
 ///
-/// A viewer plays one track at a time and almost always one of the first few, so
-/// this is deliberately small: the origin's prewarm queue is shared with video and
-/// capped at 40, and a 120-track "latest" listing must not own it.
-const MUSIC_PREWARM_LIMIT: usize = 8;
+/// 2026-11-06, cold cache, eight first plays per query, three queries:
+///
+/// | burst | playable | answered 503 | first-play latency |
+/// | ----- | -------- | ------------ | ------------------ |
+/// | 8     | 3/8      | 5            | 1.2 s free, ~12 s dead on 503 |
+/// | 2     | 7/8      | 1            | ~1.2 s |
+/// | none  | **8/8**  | **0**        | 1.1–1.7 s |
+///
+/// The cause is the origin's shape, not ours: `/resolve-files` only QUEUES
+/// (`prewarm streams batch finished {"queued":8,"resolved":0}` on every single
+/// search), its drain relays one code at a time per bot, and a play that arrives
+/// while one of our own queued codes holds that relay is refused with
+/// `503 Track temporarily busy` for the whole resolve ladder. Warming the top of a
+/// list was therefore blocking the plays it was meant to speed up, and a cold play
+/// costs only ~1.3 s when nothing is queued — cheaper than the 12 s dead end it
+/// was buying.
+///
+/// If a warmer is ever wanted back, it must go through `prewarm_streams_batch_limited`
+/// ONLY while no play has run recently, and it must be measured with this table's
+/// method, not assumed.
 
-/// Warm the ids of the tracks at the top of a music search — the SAME cheap batch
-/// the stream path uses.
+/// What `music_prewarm()` did, and why nothing replaced it.
 ///
-/// [`eclipse_stream`] consults `resolve_shortcode_cached` before doing anything, so
-/// a warmed track plays **without ever touching `/resolve-file`**. That is the whole
-/// point: when the origin's relay subsystem is saturated it answers `503 Server busy
-/// resolving file` to every cold resolve, and a cold track is then simply skipped by
-/// the player. Measured in this session: `ZMIPWf` took five consecutive 503s and a
-/// 20 s budget exhaustion because nothing had ever warmed it, while `l13Asn` — which
-/// had a cached id — played straight through the same outage.
+/// It warmed the top of every search through `prewarm_streams_batch_limited`. That
+/// looked free because the batch endpoint is cheap — but cheap is not the same as
+/// non-blocking on the ORIGIN: `/resolve-files` only queues, and the drain that
+/// follows relays one code at a time per bot. Warming eight codes therefore parked
+/// eight relay turns in front of the user, and any play that landed in that window
+/// was refused with `503 Track temporarily busy`. The measurement that decided it is
+/// in the doc comment above this line: 3/8 playable with a burst of 8, 8/8 with no
+/// burst at all, and a cold play only costs ~1.3 s.
 ///
-/// Never blocks and never fails the search: `prewarm_streams_batch_limited` skips
-/// itself while a stream is playing or the origin cooldown is armed.
-fn music_prewarm(tracks: &[Value]) {
-    let bot = get_bot_id();
-    if bot.is_empty() {
-        return;
+/// `prewarm_streams_batch_limited` is still used by the video/episode paths, where a
+/// play and a queue entry are not adjacent in time.
+
+/// Music artwork, rewritten the way video posters already are.
+///
+/// `format_track()` runs INSIDE the music-search cache, and that cache is keyed
+/// without the request's base URL — so the rewrite has to happen here, after it.
+/// The same cached answer is then correct for whichever address the client
+/// installed the addon from.
+///
+/// Only the retired `…/tgthumb/<n>.jpg` route is rewritten; see
+/// [`crate::thumb::poster_url_music`] for why the shared placeholder is kept
+/// (audio files usually have no Telegram thumb, and `/thumb/<code>` answers 404
+/// for them, which would be worse than the placeholder).
+fn local_artwork(base: &str, mut tracks: Vec<Value>) -> Vec<Value> {
+    for t in &mut tracks {
+        let art = str_at(t, "artworkURL");
+        if art.is_empty() {
+            continue;
+        }
+        let local = crate::thumb::poster_url_music(base, &art, &str_at(t, "id"));
+        if local != art && !local.is_empty() {
+            t["artworkURL"] = serde_json::json!(local);
+        }
     }
-    let codes: Vec<String> = tracks
-        .iter()
-        .take(MUSIC_PREWARM_LIMIT)
-        .map(|t| str_at(t, "id"))
-        .filter(|c| !c.is_empty())
-        .collect();
-    if codes.is_empty() {
-        return;
-    }
-    crate::resolve::prewarm_streams_batch_limited(
-        codes,
-        &bot,
-        "music",
-        MUSIC_PREWARM_LIMIT,
-    );
+    tracks
 }
 
 fn str_at(v: &Value, key: &str) -> String {
@@ -7277,17 +7865,104 @@ fn str_at(v: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// The resolve ladder every stream shares, whatever the media is.
+///
+/// There is no reason for music to resolve differently from a movie, and there
+/// never was: the difference was an accident of history. The video path walks a
+/// candidate list and steps over a bot that cannot answer; this route asked ONE
+/// bot — the one named in `session_meta` — and gave up. MEASURED 2026-11-09 on the
+/// live fleet, and it is exactly the "video plays, music does not" report:
+///
+/// ```text
+/// music stream requested {"code":"96MgM7"}
+/// env bot token failed to boot {"bot_id":"8848916386","error":"bot sign-in paused:
+///   Telegram rate limit for this bot for another 157s (FLOOD_WAIT)"}
+/// ```
+///
+/// while the pool held five other bots and a leased guest. So: ask the pinned bot
+/// first (it is the one whose caches are warm), then every READY pool bot, and skip
+/// any that are still inside a FloodWait — all inside one 12 s budget, because a
+/// cold ladder that takes 90 s is refused by the player anyway.
+///
+/// The answer carries the bot that actually resolved it, so the payload built below
+/// names that bot and `handle_download` never has to rotate across bots — a
+/// `file_reference` belongs to the bot that minted it.
+pub(crate) async fn resolve_stream_target(short_code: &str) -> (Value, u16) {
+    let mut candidates: Vec<String> = Vec::new();
+    let pinned = get_bot_id();
+    if !pinned.is_empty() {
+        candidates.push(pinned);
+    }
+    for row in crate::session::pool_ready() {
+        let id = row
+            .get("bot_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !id.is_empty() && !candidates.contains(&id) {
+            candidates.push(id);
+        }
+    }
+    if candidates.is_empty() {
+        return (resolve_shortcode_concurrent(short_code, &[]).await, 0);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut last = (Value::Null, 0u16);
+    for (i, bot) in candidates.iter().enumerate() {
+        if std::time::Instant::now() >= deadline {
+            log(
+                "stream resolve ladder ran out of budget",
+                &serde_json::json!({"short_code": short_code, "tried": i, "of": candidates.len()}),
+            );
+            break;
+        }
+        if crate::session::flood_remaining_for(bot) > 0 {
+            continue;
+        }
+        let (v, status) = crate::resolve::resolve_shortcode_status(short_code, bot, false).await;
+        let name = {
+            let t = jstr(&v, "title");
+            if t.is_empty() {
+                jstr(&v, "file_name")
+            } else {
+                t
+            }
+        };
+        if !name.is_empty() {
+            if i > 0 {
+                log(
+                    "stream resolved by a pool bot, not the pinned one",
+                    &serde_json::json!({"short_code": short_code, "bot_id": bot, "tried": i + 1}),
+                );
+            }
+            return (v, status);
+        }
+        last = (v, status);
+    }
+    last
+}
+
 /// `/eclipse/stream/<short_code>` and `/eclipse/play/<short_code>` — resolve and
-/// hand back a downloadable URL. The URL extension must match the ADVERTISED
-/// format (`.wav` for an ALAC `.m4a`, which [`crate::download`] decodes to PCM
-/// behind a WAV header), or the client skips the track.
-async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
-    let code = short_code
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+/// hand back a downloadable URL. The URL extension is the FILE'S OWN and the
+/// bytes go out untouched: there is no ALAC→WAV transcode (deleted, see
+/// `download.rs`), so an ALAC `.m4a` is served as `audio/mp4` under its real
+/// name and plays only where an ALAC decoder exists.
+///
+/// ONE envelope, TWO clients. Eclipse reads `url`/`format`/`mimeType`; BitChord
+/// installs this SAME `/music` addon and reads `url`/`codec`/`container`/
+/// `manifest`/`encrypted` out of the same answer. Both ignore unknown keys, so
+/// there is no second addon and no second route.
+async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
+    // BitChord percent-encodes the id it was handed back to us.
+    let code = crate::download::percent_decode(
+        short_code
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(".json"),
+    );
     if code.is_empty() {
         return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
     }
@@ -7299,11 +7974,10 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // The STATUS matters here: a busy origin (503 "Server busy resolving file",
     // retry_after 5) is not a missing track. Before this, every origin hiccup
     // reached the music client as `404 Track not found` and the track was skipped.
-    let (resolved, resolve_status) = if bot.is_empty() {
-        (resolve_shortcode_concurrent(&code, &[]).await, 0u16)
-    } else {
-        crate::resolve::resolve_shortcode_status(&code, &bot, false).await
-    };
+    //
+    // AND THE BOT LADDER IS THE SHARED ONE — see [`resolve_stream_target`] for why
+    // a single pinned bot was the difference between music and video.
+    let (resolved, resolve_status) = resolve_stream_target(&code).await;
     let file_name = {
         let t = jstr(&resolved, "title");
         if t.is_empty() {
@@ -7337,12 +8011,11 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
         }
         return stremio_json(404, &serde_json::json!({"error": "Track not found"}), "no-store");
     }
-    let mime = {
-        let m = jstr(&resolved, "mime");
-        let m = if m.is_empty() { jstr(&resolved, "file_type") } else { m };
-        m
-    };
     let size = resolved.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ext = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_lowercase())
+        .unwrap_or_else(|| "mp3".to_string());
     // NO renaming. The advertised `format` and `mimeType` are the file's own, and
     // the payload names the file `/api/download` will actually read. The old
     // `.wav` alias (inherited from backend.php) lied about the container: the
@@ -7351,32 +8024,639 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // (measured: magic `/isom`, not `RIFF/WAVE`) — the player's "Playback error
     // - stream unavailable". When the bytes ARE transcoded, the download
     // response says so itself (`content-type: audio/wav`, `.wav` disposition).
-    let served_mime = if mime.is_empty() {
-        "audio/mpeg".to_string()
-    } else {
-        mime.clone()
+    //
+    // The ORIGIN sometimes sends the bare word `audio` as the MIME — measured on
+    // `07.Sial.m4a` (26.7 MB, ALAC) — and that string reaches the player as
+    // `content-type`, because it travels in the payload below. A player that
+    // trusts the header will refuse it, so a slash-less value is replaced.
+    let served_mime = audio_mime(
+        &ext,
+        &jstr(&resolved, "mime"),
+        &jstr(&resolved, "file_type"),
+    );
+    // THE SAME PAYLOAD A MOVIE STREAM CARRIES.
+    //
+    // MEASURED 2026-11-09 from the live log, and it was the real asymmetry between
+    // music and video: every movie request arrives with `"file_id_present":true`
+    // ("download using the cached file_id (no re-resolve)"), while EVERY music
+    // request arrived with `false` — this route resolved the code to learn the
+    // file's name and size and then THREW THE ID AWAY. So a music seek re-entered
+    // the origin resolve, paid the cold-start gate and queued for the same part
+    // budget as a first play, where a movie seek costs one `upload.getFile`.
+    //
+    // `file_id_mt` and `bot_id` travel together on purpose: the `file_reference`
+    // inside a file id belongs to the bot that minted it, which is why
+    // `handle_download` refuses to rotate bots for a request that carries one.
+    let file_id_mt = {
+        let a = jstr(&resolved, "file_id_mt");
+        if a.is_empty() { jstr(&resolved, "file_id") } else { a }
     };
-    let ext = file_name
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_lowercase())
-        .unwrap_or_else(|| "mp3".to_string());
-    let payload = serde_json::json!({
-        "file_size": size,
-        "file_name": file_name,
-        "mime": mime,
-        "short_code": code,
+    let bot_for_payload = {
+        let b = jstr(&resolved, "bot_id");
+        if b.is_empty() { bot.clone() } else { b }
+    };
+    // The ONE payload builder, shared with the movie paths — see `stream_payload`.
+    let payload = stream_payload(
+        &code,
+        &file_name,
+        &served_mime,
+        size,
+        &file_id_mt,
+        &bot_for_payload,
+    );
+    let url = stream_url(&ctx.base_url, &payload, &file_name);
+    let mut body = serde_json::json!({
+        "url": url,
+        "format": ext,
+        "mimeType": served_mime,
+        // BitChord's rendition fields. `manifest` is explicit because it cannot
+        // tell an extensionless URL apart — ours always end in the file's own
+        // extension, so "none" is the truth rather than a default.
+        "container": container_of(&ext),
+        "manifest": "none",
+        "encrypted": false,
     });
-    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-    let url = build_stream_url(&ctx.base_url, &b64, &file_name);
-    stremio_json(
-        200,
-        &serde_json::json!({
-            "url": url,
-            "format": ext,
-            "mimeType": served_mime,
-        }),
-        "no-store",
-    )
+    // Omitted when unknown, never guessed: a wrong codec is worse than none. The
+    // bitrate needs the length, which the resolve carries as `duration` — as a
+    // number on some rows and a numeric string on others.
+    let as_int = |v: Option<&Value>| -> Option<i64> {
+        v.and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    let mut duration = as_int(resolved.get("duration"))
+        .or_else(|| as_int(resolved.get("audio").and_then(|a| a.get("duration"))))
+        .unwrap_or(0);
+    // THE FILE'S OWN HEADER, FOR A MISSING LENGTH *AND* FOR THE REAL RENDITION.
+    //
+    // A FLAC or ALAC sent as a Telegram `document` carries no Audio attribute,
+    // so the resolve has no duration — and every quality signal is derived from
+    // it, so such a track could never present as hi-res and a full-length file
+    // was eligible to be refused as a clip. The download prime reads the header
+    // once and caches it (`music::remember_head`); this path only reads.
+    //
+    // MEASURED 2026-11-11 — the lookup used to happen ONLY when `duration <= 0`,
+    // so the header of a track the catalogue already had a length for was read,
+    // cached and then never consulted: `V2U9fq` (a 3 271 kbps MCR master) answered
+    // `hi_res_lossless` with NO `sampleRate` and NO `bitDepth`, which is the one
+    // thing a hi-res file is supposed to be able to state. The length is still
+    // only taken over when the resolve had none; the rate and depth are the
+    // file's own facts and are published whenever its header has been read.
+    let probed: Option<Value> = crate::music::known_probe(&code);
+    if duration <= 0 {
+        if let Some(secs) = probed
+            .as_ref()
+            .and_then(|p| p.get("duration"))
+            .and_then(|v| v.as_i64())
+        {
+            duration = secs;
+        }
+    }
+    let codec = codec_of(&ext, size, duration);
+    if !codec.is_empty() {
+        body["codec"] = serde_json::json!(codec);
+    }
+    // Only what the file itself stated, never inferred from the extension: this
+    // is the one place a `sampleRate` or `bitDepth` may reach a client, and both
+    // came out of the file's own STREAMINFO.
+    if let Some(p) = &probed {
+        for key in ["sampleRate", "bitDepth", "channels"] {
+            if let Some(v) = p.get(key) {
+                body[key] = v.clone();
+            }
+        }
+    }
+    // THE RENDITION FIELDS A QUALITY-AWARE CLIENT READS.
+    //
+    // MEASURED 2026-11-09: BitChord sat on "upgrading quality" for tracks whose
+    // bytes were streaming fine, and its stream requests are the only ones that
+    // ask `?quality=LOSSLESS&atmos=auto` — it checks whether the rendition it was
+    // handed matches the quality it requested. Our body named the container and
+    // the codec but never the QUALITY, the size or the bitrate, so a client that
+    // cannot see "this one is lossless / this one is hi-res" keeps trying to
+    // upgrade to one that it can see. The source addon this bridge replaces sends
+    // exactly these fields, so send them too.
+    //
+    // Only what we can defend: the size is the real byte count and the bitrate is
+    // derived from it. No invented `bitDepth`/`sampleRate` — see `codec_of` on why
+    // overstating a rendition is worse than saying nothing.
+    body["size"] = serde_json::json!(size);
+    let kbps = crate::music::kbps(size, duration);
+    if kbps > 0 {
+        body["bitrate"] = serde_json::json!(kbps);
+        body["kbps"] = serde_json::json!(kbps);
+    }
+    let quality = if crate::music::is_hi_res(&ext, size, duration) {
+        "hi_res_lossless"
+    } else if crate::music::is_lossless(&ext, size, duration) {
+        "lossless"
+    } else {
+        "high"
+    };
+    body["quality"] = serde_json::json!(quality);
+    body["audioQuality"] = serde_json::json!(if quality == "high" { "HIGH" } else { "LOSSLESS" });
+    stremio_json(200, &body, "no-store")
+}
+
+/// The codec both addon protocols name for a rendition, empty when nothing we
+/// hold identifies one.
+///
+/// `.m4a` is the interesting case: it is a CONTAINER, and this catalogue really
+/// does carry both inside it — MEASURED 2026-11-07, `33xqYK` has an `alac`
+/// sample-entry box, `lyYtHg` has `mp4a`, and both are "Sial"-era `.m4a`. So the
+/// extension alone must not decide the codec; `file_size ÷ duration` does, via
+/// [`crate::music::is_lossless`] (879 kbps = ALAC, 269 kbps = AAC for the same
+/// 243 s track).
+///
+/// The asymmetry is deliberate: a lossless-class bitrate is claimed as `alac`,
+/// and anything below it is left UNKNOWN rather than guessed as `aac`. A wrong
+/// codec makes the client pick the wrong engine before the first byte arrives
+/// (Eclipse's "routing fields", BitChord's "do not overstate the stream"), while
+/// an absent one makes it probe — which is what lets a player with an ALAC
+/// decoder play the file and one without fail honestly.
+fn codec_of(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
+    if ext.eq_ignore_ascii_case("m4a") {
+        // One rule, in `music`, where it is testable beside the duration it
+        // depends on: with no duration the bitrate is 0 and the answer is "".
+        return crate::music::alac_or_unknown(file_size, duration_secs);
+    }
+    match ext.to_ascii_lowercase().as_str() {
+        "flac" => "flac",
+        "wav" => "pcm",
+        "aac" => "aac",
+        "mp3" => "mp3",
+        "opus" => "opus",
+        "ogg" | "oga" => "vorbis",
+        _ => "",
+    }
+}
+
+/// `.m4a` is a container ALIAS; the container itself is MP4.
+fn container_of(ext: &str) -> &str {
+    if ext.eq_ignore_ascii_case("m4a") { "mp4" } else { ext }
+}
+
+/// The MIME a music file is served as, given the origin's own value.
+///
+/// `mime` is sometimes the bare word `audio` at the origin (measured: the 26.7 MB
+/// ALAC `07.Sial.m4a` answered `"mime":"audio"`), while `file_type` is the
+/// Telegram kind (`audio`, `document`). Neither is a MIME, and this string ends
+/// up as the media `content-type` through the download payload, so a value with
+/// no `/` falls back to the extension's real type.
+fn audio_mime(ext: &str, mime: &str, file_type: &str) -> String {
+    let best = if mime.contains('/') {
+        mime.trim()
+    } else if file_type.contains('/') {
+        file_type.trim()
+    } else {
+        ""
+    };
+    if !best.is_empty() {
+        return best.to_string();
+    }
+    match ext {
+        "flac" => "audio/x-flac",
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" => "audio/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => "audio/mpeg",
+    }
+    .to_string()
+}
+
+/// The bot that will PERFORM an upload — a pool pick, not always the primary.
+///
+/// MEASURED 2026-11-08 on Heroku (v26): every dyno started its own fill the moment
+/// a search arrived, all through the same primary bot, and Telegram answered ten
+/// uploads in ten seconds with
+/// `FLOOD_WAIT … caused by upload.saveBigFilePart` — every fill failed. The upload
+/// budget is per ACCOUNT, so a fill has to rotate through the pool exactly the way
+/// streaming already does ([`crate::session::pick_pool_bot`], which persists its
+/// round-robin index, so consecutive fills land on different bots).
+///
+/// Falls back to the primary when the pool has nothing usable.
+fn upload_bot() -> String {
+    crate::session::pick_pool_bot()
+        .and_then(|b| {
+            b.get("bot_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(get_bot_id)
+}
+
+/// Put the rendition the client ASKED for first, because BitChord matches a
+/// recording in the order we return and then plays that one row.
+///
+/// MEASURED 2026-11-07, "two years" by ROSÉ: BitChord requested
+/// `quality=LOSSLESS` twice for `d931Ow` (a 2.8 MB mp3, the FIRST row) and twice
+/// for `lyYtHg` (an m4a), and never once requested `Tap9pP` — the FLAC of the
+/// same recording sitting third in the same answer. It then fetched neither
+/// returned URL, because a 128 kbps mp3 is not a bit-exact rendition: the song
+/// simply did not play while the lossless copy was in the list.
+///
+/// The tier is NOT recomputed here: [`crate::music::format_track`] already
+/// stamped `audioQuality`, and it is the only place with both `file_size` and
+/// `duration`. That is what lets an ALAC `.m4a` (879 kbps) outrank an AAC `.m4a`
+/// (269 kbps) of the same song when the catalogue holds no FLAC at all — the
+/// Indonesian titles are exactly that case: 30 rows, zero flac, and the lossless
+/// master sitting in Telegram as an `.m4a`.
+///
+/// FOUR tiers now, because the client sends four: `hi_res`, `lossless`, `medium`
+/// and `low` (measured 2026-11-07 on Heroku: `asked:"hi_res"` on the search,
+/// `quality=LOSSLESS` on the stream).
+///
+/// - `hi_res` puts a genuine master first — lossless AND above CD bitrate — then
+///   any other lossless, then lossy. Without this a `hi_res` request was answered
+///   in the origin's order, so the CD copy we were about to replace could still
+///   outrank the 24-bit master we had just fetched.
+/// - `lossless` puts any bit-exact row first (the original measured failure).
+/// - `medium` prefers a normal lossy file, the one nearest 256 kbps.
+/// - `low` prefers the SMALLEST lossy file that still plays.
+///
+/// Sorting is stable, so the origin's ranking survives inside each group, and
+/// every other value — no `quality`, `high`, an option we do not publish — keeps
+/// the origin's order untouched, which is what the video-era rule ("do not
+/// re-sort, the origin's order IS the ranking") was about. Rows are never
+/// DROPPED: hiding every lossy file would hide most of the catalogue from a
+/// client that asks for lossless on every request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Want {
+    HiRes,
+    Lossless,
+    Medium,
+    Low,
+}
+
+fn want_of(quality: &str) -> Option<Want> {
+    match quality.trim().to_ascii_lowercase().as_str() {
+        "hi_res" | "hi-res" | "hires" => Some(Want::HiRes),
+        "lossless" => Some(Want::Lossless),
+        "medium" | "mid" => Some(Want::Medium),
+        "low" | "datasaver" | "data_saver" => Some(Want::Low),
+        _ => None,
+    }
+}
+
+/// Does the catalogue ALREADY answer the tier the client asked for?
+///
+/// This is the backfill's whole gate. A fill costs one source search and a
+/// 20–45 MB upload, so it must only happen when the answer the client wanted is
+/// genuinely absent from `rows`:
+///
+/// - `hi_res` → needs a row above CD bitrate, not merely a lossless one;
+/// - `lossless` → any bit-exact row is enough, hi-res or CD;
+/// - `medium` / `low` / unpublished → always satisfied, because a fill uploads a
+///   MASTER and can never be the thing those tiers were missing.
+///
+/// MEASURED 2026-11-09: the previous rule ("fill whenever there is no hi-res row")
+/// fired 19 times in one minute off ordinary lossless browsing.
+fn tier_satisfied(rows: &[Value], quality: &str) -> bool {
+    let size = |t: &Value| t.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let duration = |t: &Value| t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+    match want_of(quality) {
+        Some(Want::HiRes) => rows
+            .iter()
+            .any(|t| crate::music::is_hi_res(&str_at(t, "format"), size(t), duration(t))),
+        Some(Want::Lossless) => rows
+            .iter()
+            .any(|t| crate::music::is_lossless(&str_at(t, "format"), size(t), duration(t))),
+        _ => true,
+    }
+}
+
+fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
+    let Some(want) = want_of(quality) else {
+        return tracks;
+    };
+    let mut rows: Vec<((u8, u64), Value)> = tracks
+        .into_iter()
+        .map(|t| {
+            let format = str_at(&t, "format");
+            let size = t.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let duration = t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+            let lossless = str_at(&t, "audioQuality") == "LOSSLESS";
+            let hi_res = crate::music::is_hi_res(&format, size, duration);
+            // An unknown bitrate must never win a "smallest file" race.
+            let kbps = match crate::music::kbps(size, duration) {
+                0 => u64::MAX,
+                k => k,
+            };
+            // Inside the hi-res/lossless groups the HIGHEST bitrate wins, not the
+            // origin's order: a 5122 kbps master must beat a 1832 kbps one.
+            //
+            // The key ASCENDS, so a higher bitrate has to map to a SMALLER value
+            // (`u64::MAX - kbps`) and an UNKNOWN one to the largest value of all.
+            //
+            // MEASURED 2026-11-11 — this was inverted: `kbps` is ALREADY
+            // `u64::MAX` for an unknown row, so `u64::MAX - (u64::MAX - 1) == 1`
+            // handed every row whose length the catalogue does not know the
+            // SMALLEST key, i.e. it sorted FIRST — the opposite of what the
+            // comment here used to claim. `q=back to me&quality=LOSSLESS` put
+            // eight `duration: 0` FLACs at positions 1-8 and pushed a 2852 kbps
+            // master to position 9; the SAME rows ordered correctly under
+            // `quality=HI_RES`, because there the hi-res bit is a separate leading
+            // key. A row with no known bitrate is one we cannot call hi-res, so it
+            // must rank last.
+            let best_first = if kbps == u64::MAX {
+                u64::MAX
+            } else {
+                u64::MAX - kbps.min(u64::MAX - 1)
+            };
+            let key = match want {
+                Want::HiRes => (
+                    if hi_res { 0 } else if lossless { 1 } else { 2 },
+                    best_first,
+                ),
+                Want::Lossless => (if lossless { 0 } else { 1 }, best_first),
+                Want::Medium => (
+                    if lossless { 1 } else { 0 },
+                    kbps.abs_diff(256),
+                ),
+                // SIZE, not bitrate: the smallest files in this catalogue are
+                // YouTube rips with `duration: 0`, so their bitrate is unknown —
+                // ranking by bitrate pushed exactly the data-saver rows to the
+                // bottom (measured: `low` returned the same order as `medium`).
+                Want::Low => (
+                    if lossless { 1 } else { 0 },
+                    if size == 0 { u64::MAX } else { size },
+                ),
+            };
+            (key, t)
+        })
+        .collect();
+    rows.sort_by_key(|(key, _)| *key);
+    rows.into_iter().map(|(_, t)| t).collect()
+}
+
+#[cfg(test)]
+mod bitchord_tests {
+    use super::*;
+
+    /// Test-only: stamp `audioQuality` on already-formatted rows.
+    ///
+    /// The tier itself is NEVER decided here — [`crate::music::tier()`] decides
+    /// it, and these tests only check that a row keeps its identity and that a
+    /// lossy container is never promoted. Called with no size/duration, which is
+    /// the honest worst case: anything not inherently bit-exact must stay HIGH.
+    fn add_audio_quality(rows: Vec<Value>) -> Vec<Value> {
+        rows.into_iter()
+            .map(|mut r| {
+                let format = str_at(&r, "format");
+                r["audioQuality"] =
+                    serde_json::json!(crate::music::tier(&format, 0, 0));
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_keeps_the_id_and_title_bit_chord_matches_on() {
+        let rows = add_audio_quality(vec![serde_json::json!({
+            "id": "wULLeI",
+            "title": "Be Her",
+            "artist": "Ella Langley",
+            "format": "flac"
+        })]);
+        assert_eq!(rows[0]["id"], "wULLeI");
+        assert_eq!(rows[0]["title"], "Be Her");
+        assert_eq!(rows[0]["audioQuality"], "LOSSLESS");
+    }
+
+    #[test]
+    fn a_lossy_row_is_never_labelled_lossless() {
+        let rows = add_audio_quality(vec![
+            serde_json::json!({"id": "a", "title": "t", "format": "mp3"}),
+            serde_json::json!({"id": "b", "title": "t", "format": "M4A"}),
+        ]);
+        assert_eq!(rows[0]["audioQuality"], "HIGH");
+        assert_eq!(rows[1]["audioQuality"], "HIGH");
+    }
+
+    /// The measured failure, as a test: a LOSSLESS request must reach the FLAC
+    /// before the mp3 of the same song, must not lose a row doing it, and — the
+    /// Indonesian case — must prefer an ALAC `.m4a` over an AAC one when there is
+    /// no FLAC in the answer at all.
+    #[test]
+    fn a_lossless_request_puts_the_lossless_rows_first_and_drops_nothing() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "aac", "format": "m4a", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "alac", "format": "m4a", "audioQuality": "LOSSLESS"}),
+                serde_json::json!({"id": "mp3", "format": "mp3", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "flac", "format": "flac", "audioQuality": "LOSSLESS"}),
+            ],
+            "LOSSLESS",
+        );
+        assert_eq!(rows.len(), 4);
+        // Stable: the two lossless rows keep their relative order, then the lossy.
+        assert_eq!(rows[0]["id"], "alac");
+        assert_eq!(rows[1]["id"], "flac");
+        assert_eq!(rows[2]["id"], "aac");
+        assert_eq!(rows[3]["id"], "mp3");
+    }
+
+    /// A quality we do not publish — and the no-quality case Eclipse takes —
+    /// leaves the origin's ranking exactly as it was.
+    #[test]
+    fn only_a_published_quality_reorders() {
+        for q in ["", "HIGH", "high", "max"] {
+            let rows = rank_for_tier(
+                vec![
+                    serde_json::json!({"id": "aac", "format": "m4a", "audioQuality": "HIGH"}),
+                    serde_json::json!({"id": "flac", "format": "flac", "audioQuality": "LOSSLESS"}),
+                ],
+                q,
+            );
+            assert_eq!(rows[0]["id"], "aac", "quality={q} must keep the origin order");
+        }
+    }
+
+    /// Four rows that are the same 240 s song at four qualities: a 24/96 master
+    /// (4600 kbps), a CD FLAC (900), a 320k mp3 and a 128k mp3.
+    fn four_qualities() -> Vec<Value> {
+        vec![
+            serde_json::json!({"id": "cd", "format": "flac", "audioQuality": "LOSSLESS",
+                               "size": 27_000_000u64, "duration": 240}),
+            serde_json::json!({"id": "mp3low", "format": "mp3", "audioQuality": "HIGH",
+                               "size": 3_840_000u64, "duration": 240}),
+            serde_json::json!({"id": "hi", "format": "flac", "audioQuality": "LOSSLESS",
+                               "size": 138_000_000u64, "duration": 240}),
+            serde_json::json!({"id": "mp3high", "format": "mp3", "audioQuality": "HIGH",
+                               "size": 9_600_000u64, "duration": 240}),
+        ]
+    }
+
+    /// `hi_res` is what BitChord actually asks for, and the master has to come
+    /// first even when a CD copy of the same recording is already in the answer —
+    /// which is exactly the copy we are about to replace.
+    #[test]
+    fn a_hi_res_request_puts_the_master_above_the_cd_copy() {
+        let rows = rank_for_tier(four_qualities(), "hi_res");
+        assert_eq!(rows.len(), 4, "nothing is ever dropped");
+        assert_eq!(rows[0]["id"], "hi");
+        assert_eq!(rows[1]["id"], "cd", "CD lossless beats any lossy");
+    }
+
+    /// Inside the hi-res group the highest bitrate wins, not the origin's order:
+    /// measured on `Sweet Child O' Mine`, the 1832 kbps copy was listed before the
+    /// 5122 kbps master and outranked it.
+    #[test]
+    fn the_best_master_wins_inside_the_hi_res_group() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "hi1832", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 81_504_144u64, "duration": 356}),
+                serde_json::json!({"id": "hi5122", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 227_928_900u64, "duration": 356}),
+            ],
+            "hi_res",
+        );
+        assert_eq!(rows[0]["id"], "hi5122", "the bigger master wins despite the order");
+    }
+
+    /// A row whose length the catalogue does not know has NO bitrate, so it can
+    /// never be the hi-res one — and it must not be ranked as though it were.
+    ///
+    /// MEASURED 2026-11-11 on `q=back to me&quality=LOSSLESS`: 30 FLAC rows, the
+    /// first EIGHT of them `duration: 0` (files Telegram holds as `document`, so
+    /// they carry no Audio attribute). `best_first` is `u64::MAX - kbps`, but
+    /// `kbps` had ALREADY been replaced by `u64::MAX` for an unknown row, so it
+    /// collapsed to `1` — the smallest key of all. The eight unknown rows took
+    /// positions 1-8 and a real 2852 kbps master was pushed to position 9, so the
+    /// client played a duration-less FLAC while the hi-res copy sat below the fold.
+    /// The same rows under `quality=HI_RES` ordered correctly, because there the
+    /// hi-res bit is a separate leading key — which is why the lossless branch
+    /// looked like a deliberate policy rather than an inverted sort.
+    #[test]
+    fn an_unknown_bitrate_ranks_last_not_first() {
+        let rows = rank_for_tier(
+            vec![
+                // 35 188 598 B over an UNKNOWN length — "05.Kanye.West.BACK.TO.ME.flac".
+                serde_json::json!({"id": "unknown", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 35_188_598u64, "duration": 0}),
+                // 52 969 141 B / 224 s = 1892 kbps.
+                serde_json::json!({"id": "cd", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 52_969_141u64, "duration": 224}),
+                // 90 202 285 B / 253 s = 2852 kbps.
+                serde_json::json!({"id": "master", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 90_202_285u64, "duration": 253}),
+            ],
+            "LOSSLESS",
+        );
+        assert_eq!(rows.len(), 3, "nothing is ever dropped");
+        assert_eq!(rows[0]["id"], "master", "2852 kbps ranks above 1892 kbps");
+        assert_eq!(rows[1]["id"], "cd", "among KNOWN bitrates the higher still wins");
+        assert_eq!(
+            rows[2]["id"], "unknown",
+            "a row with no known length must rank LAST, not first"
+        );
+    }
+
+    /// `medium` is a normal lossy file, and the one nearest 256 kbps wins.
+    /// The gate that decides whether a fill is worth a source call at all.
+    ///
+    /// The measured flood (2026-11-09): 23 lossless rows, no hi-res row, the
+    /// client asking `LOSSLESS` — and the old rule filled anyway.
+    #[test]
+    fn only_a_missing_tier_triggers_a_fill() {
+        let cd_flac = serde_json::json!({
+            "format": "flac", "size": 32_000_000u64, "duration": 283, "audioQuality": "LOSSLESS"
+        });
+        let master = serde_json::json!({
+            "format": "flac", "size": 90_000_000u64, "duration": 283, "audioQuality": "LOSSLESS"
+        });
+        let lossy = serde_json::json!({
+            "format": "mp3", "size": 9_000_000u64, "duration": 283, "audioQuality": "HIGH"
+        });
+
+        // A hi-res request is answered by a master, and only by a master.
+        assert!(tier_satisfied(&[master.clone()], "hi_res"));
+        assert!(!tier_satisfied(&[cd_flac.clone()], "hi_res"));
+        // A lossless request is answered by a CD FLAC — no fill on that browse.
+        assert!(tier_satisfied(&[cd_flac.clone()], "LOSSLESS"));
+        assert!(!tier_satisfied(&[lossy.clone()], "lossless"));
+        // medium/low (and an unpublished quality) are never a reason to upload.
+        assert!(tier_satisfied(&[], "medium"));
+        assert!(tier_satisfied(&[], "low"));
+        assert!(tier_satisfied(&[], ""));
+
+        let rows: Vec<Value> = (0..23).map(|_| cd_flac.clone()).collect();
+        assert!(
+            tier_satisfied(&rows, "LOSSLESS"),
+            "a CD FLAC must never trigger a fill"
+        );
+        assert!(
+            !tier_satisfied(&rows, "hi_res"),
+            "a hi-res request still fills"
+        );
+    }
+
+    #[test]
+    fn a_medium_request_prefers_lossy_near_256k() {
+        let rows = rank_for_tier(four_qualities(), "medium");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["id"], "mp3high", "320k is nearer 256k than 128k");
+        assert_eq!(rows[1]["id"], "mp3low");
+        assert_eq!(rows[2]["id"], "cd", "lossless is kept, but last");
+    }
+
+    /// `low` is data saver: the smallest file that still plays comes first.
+    #[test]
+    fn a_low_request_prefers_the_smallest_lossy_file() {
+        let rows = rank_for_tier(four_qualities(), "low");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["id"], "mp3low");
+        assert_eq!(rows[1]["id"], "mp3high");
+        assert_eq!(rows[3]["id"], "hi");
+    }
+
+    /// A row with no SIZE cannot be the smallest file; one with a size but no
+    /// duration CAN, and must — those are the YouTube rips a data-saver wants.
+    #[test]
+    fn low_ranks_by_size_not_by_bitrate() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "nosize", "format": "mp3", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "big", "format": "mp3", "audioQuality": "HIGH",
+                                   "size": 14_256_960u64, "duration": 356}),
+                serde_json::json!({"id": "tiny_no_duration", "format": "mp3",
+                                   "audioQuality": "HIGH", "size": 4_848_044u64}),
+            ],
+            "low",
+        );
+        assert_eq!(rows[0]["id"], "tiny_no_duration", "smallest by size wins");
+        assert_eq!(rows[1]["id"], "big");
+        assert_eq!(rows[2]["id"], "nosize", "no size is never the smallest");
+    }
+
+    #[test]
+    fn a_slashless_origin_mime_is_replaced_by_the_extension() {
+        // Measured: the origin answered `mime: "audio"` for a 26.7 MB ALAC `.m4a`.
+        assert_eq!(audio_mime("m4a", "audio", "audio"), "audio/mp4");
+        assert_eq!(audio_mime("flac", "audio/x-flac", "audio"), "audio/x-flac");
+        assert_eq!(audio_mime("mp3", "", "audio"), "audio/mpeg");
+        assert_eq!(audio_mime("wav", "", ""), "audio/wav");
+    }
+
+    #[test]
+    fn the_rendition_names_a_real_codec_and_container() {
+        assert_eq!(codec_of("flac", 0, 0), "flac");
+        assert_eq!(codec_of("mp3", 0, 0), "mp3");
+        assert_eq!(codec_of("WAV", 0, 0), "pcm");
+        assert_eq!(codec_of("sbin", 0, 0), "");
+        // `.m4a` is a container: 26.7 MB over 243 s is ALAC (Qobuz serves the
+        // same master at 886 kbps), 8.2 MB is AAC 256k. Only the lossless class
+        // is claimed; the lossy one stays unknown rather than a guess.
+        assert_eq!(codec_of("m4a", 26_704_889, 243), "alac");
+        assert_eq!(codec_of("m4a", 8_187_833, 243), "");
+        assert_eq!(codec_of("m4a", 0, 0), "");
+        assert_eq!(container_of("m4a"), "mp4");
+        assert_eq!(container_of("flac"), "flac");
+    }
 }
 
 /* ── subtitles (backend.php:13789 + fd_get_item_subtitles) ────────────────── */
@@ -8512,6 +9792,36 @@ mod tests {
             parse_external_id("tt11540908:1:1"),
             Some(("imdb", "tt11540908".to_string(), 1, 1))
         );
+        // ANIME IDS ARE EPISODE-NUMBERED. AIOMetadata publishes Black Clover as
+        // `kitsu:13209:1` … `:170`, so a click on episode 16 is `kitsu:13209:16`.
+        // Reading the trailing number as a SEASON sent the search to S16E1 and the
+        // whole show answered "No Streams Found".
+        assert_eq!(
+            parse_external_id("kitsu:13209:16"),
+            Some(("kitsu", "13209".to_string(), 1, 16))
+        );
+        assert_eq!(
+            parse_external_id("kitsu:13209:43"),
+            Some(("kitsu", "13209".to_string(), 1, 43))
+        );
+        // The 4-segment form is still season:episode.
+        assert_eq!(
+            parse_external_id("kitsu:13209:1:16"),
+            Some(("kitsu", "13209".to_string(), 1, 16))
+        );
+        assert_eq!(
+            parse_external_id("mal:54492:5"),
+            Some(("mal", "54492".to_string(), 1, 5))
+        );
+        // Season-based providers keep the old reading, and a series ROOT is a root.
+        assert_eq!(
+            parse_external_id("tvdb:81797:2"),
+            Some(("tvdb", "81797".to_string(), 2, 0))
+        );
+        assert_eq!(
+            parse_external_id("kitsu:13209"),
+            Some(("kitsu", "13209".to_string(), 0, 0))
+        );
         // An `tt` id shorter than 6 digits is not an IMDb id.
         assert_eq!(parse_external_id("tt123"), None);
         // The scalar prefixes, with and without `:S:E`.
@@ -8576,6 +9886,82 @@ mod tests {
         }
     }
 
+    /* ── the pencarimovie.com fallback link ───────────────────────────────── */
+
+    /// The card's link is the ONLY way out of an empty stream list, so the
+    /// keyword it searches for and the origin it points at both have to work.
+    ///
+    /// Reported as "on streams list no stream found" for
+    /// `.../search/Kudrat 1968: High Council 2026 • Movie?ddldomain=` — the
+    /// post-title decoration went into the keyword and nothing matched.
+    #[test]
+    fn no_streams_card_searches_the_clean_title_on_this_origin() {
+        let ctx = ctx_with(&[("host", "127.0.0.1:8088")], "http://127.0.0.1:8088", &[]);
+        let card = no_streams_card(
+            &ctx,
+            "Kudrat 1968: High Council 2026 • Movie",
+            "pm:post:9000031194",
+            false,
+            0,
+        );
+        let url = card["externalUrl"].as_str().unwrap();
+        // The year inside the title stays; only the type decoration goes.
+        assert!(
+            url.contains("Kudrat%201968%3A%20High%20Council%202026?"),
+            "{url}"
+        );
+        assert!(!url.contains("Movie"), "{url}");
+        // Loopback needs no credential, so no token segment is appended.
+        assert!(url.starts_with("https://pencarimovie.com/search/"), "{url}");
+        assert!(
+            url.ends_with("?ddldomain=http%3A%2F%2F127.0.0.1%3A8088"),
+            "{url}"
+        );
+    }
+
+    /// A title that is ALREADY clean must survive untouched — a series whose
+    /// real name ends in a type word must not lose it.
+    #[test]
+    fn no_streams_card_keeps_an_undecorated_title_whole() {
+        let ctx = ctx_with(&[], "http://127.0.0.1:8088", &[]);
+        let card = no_streams_card(&ctx, "The Galaxy Movie", "tvdb:1", false, 0);
+        let url = card["externalUrl"].as_str().unwrap();
+        assert!(
+            url.contains("The%20Galaxy%20Movie?"),
+            "only a `• Type` TAIL may be dropped: {url}"
+        );
+    }
+
+    #[test]
+    fn loopback_ddl_domains_carry_no_token() {
+        assert_eq!(ddl_domain_value("http://127.0.0.1:8088/"), "http://127.0.0.1:8088");
+        assert_eq!(ddl_domain_value("http://localhost:8088"), "http://localhost:8088");
+        assert_eq!(ddl_domain_value("http://[::1]:8088/"), "http://[::1]:8088");
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_and_nothing_else_is() {
+        for h in [
+            "127.0.0.1",
+            "127.10.20.30",
+            "localhost",
+            "app.localhost",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(host_is_loopback(h), "{h} must be loopback");
+        }
+        for h in [
+            "",
+            "192.168.2.225",
+            "stream.pencarimovie.com",
+            "10.0.0.5",
+            "localhost.evil.test",
+        ] {
+            assert!(!host_is_loopback(h), "{h} must NOT be loopback");
+        }
+    }
+
     /* ── issue #9: every entry needs a `title` ────────────────────────────── */
 
     #[test]
@@ -8632,6 +10018,55 @@ mod tests {
     /// Do NOT re-add it "because issue #9 asked for a title": that text already
     /// lives on line 1 of `description`, which every client renders, plus the
     /// pill line. If a future client needs a second line, extend `description`.
+    /// One payload shape for music AND video, with `file_id_mt` + `bot_id`
+    /// travelling together or not at all — the drift this function exists to stop
+    /// was music resolving on every Range while video never did.
+    #[test]
+    fn a_stream_payload_has_one_shape_for_music_and_video() {
+        let with_id = stream_payload("abc123", "Song.flac", "audio/flac", 1234, "IDMT", "bot-1");
+        assert_eq!(jstr(&with_id, "short_code"), "abc123");
+        assert_eq!(jstr(&with_id, "file_name"), "Song.flac");
+        assert_eq!(jstr(&with_id, "mime"), "audio/flac");
+        assert_eq!(with_id.get("file_size").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(jstr(&with_id, "file_id_mt"), "IDMT");
+        assert_eq!(jstr(&with_id, "file_id"), "IDMT");
+        assert_eq!(jstr(&with_id, "bot_id"), "bot-1");
+
+        // Same keys whichever media type asks for it.
+        let video = stream_payload("xyz", "Film.mkv", "video/x-matroska", 9, "", "");
+        let mut music_keys: Vec<&str> = with_id
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !matches!(*k, "file_id_mt" | "file_id" | "bot_id"))
+            .collect();
+        let mut video_keys: Vec<&str> =
+            video.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        music_keys.sort();
+        video_keys.sort();
+        assert_eq!(music_keys, video_keys, "music and video must share one shape");
+
+        // No id, or no bot: neither is written — an id without its bot would 410.
+        assert!(video.get("file_id_mt").is_none());
+        assert!(video.get("bot_id").is_none());
+        let orphan = stream_payload("abc", "Film.mkv", "video/x-matroska", 9, "IDMT", "  ");
+        assert!(
+            orphan.get("file_id_mt").is_none(),
+            "an id must never travel without its bot"
+        );
+
+        // The URL is the same endpoint for both, and the payload round-trips.
+        let url = stream_url("https://host", &with_id, "Song.flac");
+        assert!(url.contains("/api/download/"), "{url}");
+        assert!(url.ends_with("Song.flac"), "{url}");
+        let b64 = crate::fileid::base64url_encode(with_id.to_string().as_bytes());
+        let round = crate::download::decode_download_payload(&b64);
+        assert_eq!(jstr(&round, "short_code"), "abc123");
+        assert_eq!(jstr(&round, "file_id_mt"), "IDMT");
+        assert_eq!(jstr(&round, "bot_id"), "bot-1");
+    }
+
     #[test]
     fn a_stream_item_never_carries_a_title_field() {
         let item = crate::matcher::FileItem {
@@ -9170,6 +10605,47 @@ mod tests {
         }
     }
 
+    /// A music source is operator input, so it is normalised on the way IN: the
+    /// same base pasted as `/c`, `/c/` and `/c/manifest.json` must be one row,
+    /// and a URL that is not an http(s) address must refuse the SAVE rather than
+    /// be silently dropped.
+    #[test]
+    fn a_music_source_is_normalised_deduped_and_never_saved_malformed() {
+        let cleaned = clean_music_sources(&[
+            serde_json::json!({"url": "https://host/c/manifest.json", "name": "BitChord", "enabled": true}),
+            serde_json::json!({"url": "https://host/c/", "name": "duplicate"}),
+            serde_json::json!({"url": "https://other/a", "enabled": false}),
+            serde_json::json!({"url": "   "}),
+        ])
+        .expect("well-formed rows are accepted");
+        assert_eq!(cleaned.len(), 2, "the duplicate base collapsed: {cleaned:?}");
+        assert_eq!(cleaned[0]["url"], "https://host/c");
+        assert_eq!(cleaned[0]["name"], "BitChord");
+        assert_eq!(cleaned[0]["enabled"], serde_json::json!(true));
+        assert_eq!(cleaned[0]["id"], "ms-host-c", "an id is minted when none is given");
+        assert_eq!(cleaned[1]["enabled"], serde_json::json!(false));
+        // `enabled` defaults ON: a row the dashboard wrote without the flag is a
+        // source the operator meant to use.
+        let default_on = clean_music_sources(&[serde_json::json!({"url": "https://h/x"})]).unwrap();
+        assert_eq!(default_on[0]["enabled"], serde_json::json!(true));
+
+        let err = clean_music_sources(&[
+            serde_json::json!({"url": "https://good/c"}),
+            serde_json::json!({"url": "not a url"}),
+        ])
+        .expect_err("one malformed row refuses the whole save");
+        assert!(err.contains("not a url"), "{err}");
+    }
+
+    /// A fresh install has NO music upstream: the fill path is off until the
+    /// operator adds one (or sets `PM_HIRES_BASE`).
+    #[test]
+    fn a_fresh_install_ships_no_music_source() {
+        let settings = default_catalog_settings();
+        assert_eq!(settings["music_sources"], serde_json::json!([]));
+        assert!(settings["music_sources"].is_array(), "the dashboard iterates it");
+    }
+
     #[test]
     fn catalog_settings_env_layer_is_the_base() {
         // The env layer supplies what an ephemeral host would otherwise lose ...
@@ -9467,5 +10943,40 @@ mod tests {
         );
         let nothing = serde_json::json!({"title": "Untitled"});
         assert_eq!(series_released_anchor(&nothing), None);
+    }
+
+    #[test]
+    fn diagnostics_activity_reports_titles_and_online() {
+        let v = diagnostics_payload(Vec::new());
+        let activity = &v["activity"];
+        for key in [
+            "streams",
+            "preflights",
+            "total",
+            "titles",
+            "online",
+            "refused_429",
+        ] {
+            assert!(activity[key].is_number(), "activity.{key} must be a number: {activity}");
+        }
+        // Null until a second CPU sample exists, a number after.
+        assert!(activity["cpu_percent"].is_null() || activity["cpu_percent"].is_number());
+        assert!(v["info"]["process_rss_mb"].is_number());
+        assert!(v["info"]["proc_uptime_s"].is_number());
+        assert!(v["info"]["host_uptime_s"].is_number());
+        // The ceiling the UI shows is the container's when there is one, and the
+        // host's RAM stays in its own key so "62 GB" can never be rendered as
+        // headroom on a 1 GB dyno.
+        assert!(v["info"]["total_memory_mb"].is_number());
+        assert!(v["info"]["host_total_memory_mb"].is_number());
+        assert!(v["info"]["container"].is_boolean());
+        // The keys the Android service already reads must survive unchanged.
+        assert_eq!(v["ok"], 1);
+        assert!(v["counts"].is_object());
+        assert!(v["reports"].is_array());
+        // The REST origin is its own object, not a catalog: host + the two gates.
+        assert!(v["origin"]["host"].is_string(), "origin.host is the configured endpoint");
+        assert!(v["origin"]["down_s"].is_number());
+        assert!(v["origin"]["resolve_cooldown_s"].is_number());
     }
 }
