@@ -26,9 +26,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use grammers_client::media::Downloadable;
+use grammers_client::media::{Downloadable, InputAudio, Media};
+use grammers_client::message::InputMessage;
 use grammers_client::{Client, InvocationError, SenderPool};
-use grammers_session::types::{ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::types::{
+    ChannelState, DcOption, PeerId, PeerInfo, PeerRef, UpdateState, UpdatesState,
+};
 use grammers_session::{BoxFuture as SessFuture, Session, SessionData};
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
@@ -653,6 +656,32 @@ pub struct DocTarget {
     pub location: tl::enums::InputFileLocation,
 }
 
+impl DocTarget {
+    /// The `(id, access_hash, file_reference)` triple this target addresses, for
+    /// persisting a file WE sent: the ledger keeps it so a later request can be
+    /// answered without resolving anything through the origin.
+    fn doc_location(&self) -> Option<&tl::types::InputDocumentFileLocation> {
+        match &self.location {
+            tl::enums::InputFileLocation::InputDocumentFileLocation(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn doc_id(&self) -> i64 {
+        self.doc_location().map(|l| l.id).unwrap_or(0)
+    }
+
+    pub fn access_hash(&self) -> i64 {
+        self.doc_location().map(|l| l.access_hash).unwrap_or(0)
+    }
+
+    pub fn file_ref(&self) -> Vec<u8> {
+        self.doc_location()
+            .map(|l| l.file_reference.clone())
+            .unwrap_or_default()
+    }
+}
+
 impl Downloadable for DocTarget {
     fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
         Some(self.location.clone())
@@ -667,6 +696,334 @@ impl Downloadable for DocTarget {
     fn dc_id(&self) -> Option<i32> {
         Some(self.dc_id)
     }
+}
+
+/* ── upload + send (the backfill primitive) ──────────────────────────────── */
+
+/// One file we sent ourselves, described the way the byte path already wants it.
+///
+/// `DocTarget` is the ONLY thing `fetch_range` accepts, and a send result carries
+/// exactly what it needs: `document.dc_id`, `document.size`, and the
+/// `(id, access_hash, file_reference)` triple that becomes an
+/// `InputDocumentFileLocation`. That is why a backfilled file is playable with no
+/// resolve, no origin round-trip and no second streaming path — the handle from
+/// the send IS the handle for the download.
+pub struct SentDoc {
+    pub target: DocTarget,
+    pub message_id: i32,
+    /// `id_access_dc` — the identity of THIS upload, for a persisted record.
+    pub key: String,
+}
+
+/// Resolve `@username` (or a bare name) to the peer to send to.
+///
+/// The peer is a relay ACCOUNT, not a bot: the origin relays through one of these
+/// because Telegram does not deliver bot-to-bot messages, and that account has an
+/// open chat with every bot in the pool. `tgfile_userbot_accounts()` on the origin
+/// is the same list, exposed by `GET /userbots`.
+pub async fn resolve_peer(client: &Client, username: &str) -> Result<PeerRef, GramErr> {
+    let name = username.trim().trim_start_matches('@');
+    if name.is_empty() {
+        return Err(GramErr {
+            message: "resolve_peer: empty address".to_string(),
+            ..Default::default()
+        });
+    }
+    // A bare numeric id is a USER with no username — which is what the relay pool
+    // actually publishes (measured: four accounts, `"username": ""` on all of
+    // them). There is no `contacts.resolveUsername` for that, so the dialog list
+    // is the only source of an `access_hash`.
+    if let Ok(uid) = name.parse::<i64>() {
+        return resolve_peer_by_id(client, uid).await;
+    }
+    let peer = match client.resolve_username(name).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(GramErr {
+                message: format!("resolve_peer: @{name} not found"),
+                ..Default::default()
+            })
+        }
+        Err(e) => {
+            return Err(GramErr {
+                message: format!("resolve_peer @{name}: {e}"),
+                ..Default::default()
+            })
+        }
+    };
+    // `PeerRef` is what every send takes; the cache also makes the second call
+    // free, which matters because a backfill resolves the same relay account
+    // once per upload.
+    match peer.to_ref().await {
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => Err(GramErr {
+            message: format!("resolve_peer @{name}: no reference (not in session cache)"),
+            ..Default::default()
+        }),
+        Err(e) => Err(GramErr {
+            message: format!("resolve_peer @{name}: {e}"),
+            ..Default::default()
+        }),
+    }
+}
+
+/// How many dialogs to walk before giving up on finding a relay account. The
+/// pool accounts are contacted constantly, so they are always recent; the cap
+/// only bounds a pathological bot account.
+const DIALOG_SCAN_LIMIT: usize = 400;
+
+/// Resolve a numeric user id to a sendable peer via the bot's OWN dialog list.
+///
+/// The relay accounts carry no `@username` (the pool manifest publishes ids
+/// only), and Telegram needs an `access_hash` to address a user. The dialog list
+/// holds one for every chat the bot already has, which is the same precondition
+/// the PHP relay depends on: the account has an open chat with the bot. So a
+/// miss here means exactly that — no chat — and it says so instead of sending
+/// into the void.
+pub async fn resolve_peer_by_id(client: &Client, user_id: i64) -> Result<PeerRef, GramErr> {
+    let mut dialogs = client.iter_dialogs();
+    let mut seen = 0usize;
+    while seen < DIALOG_SCAN_LIMIT {
+        let next = dialogs.next().await.map_err(|e| GramErr {
+            message: format!("iter_dialogs: {e}"),
+            ..Default::default()
+        })?;
+        let Some(dialog) = next else { break };
+        seen += 1;
+        let peer = dialog.peer();
+        if peer.id().bare_id() != Some(user_id) {
+            continue;
+        }
+        return match peer.to_ref().await {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => Err(GramErr {
+                message: format!("relay {user_id}: dialog present but no reference"),
+                ..Default::default()
+            }),
+            Err(e) => Err(GramErr {
+                message: format!("relay {user_id}: {e}"),
+                ..Default::default()
+            }),
+        };
+    }
+    Err(GramErr {
+        message: format!(
+            "relay {user_id} is not in this bot's dialogs ({seen} scanned) — the account must have an open chat with the bot"
+        ),
+        ..Default::default()
+    })
+}
+
+/// Stream `source` into Telegram and send it as an audio document, returning the
+/// [`DocTarget`] that makes it immediately playable.
+///
+/// `upload_stream`, not `upload_file`: the source is a remote HTTP body (the
+/// Qobuz CDN response), so there is no file on disk to read and no temp file to
+/// clean up. Above `BIG_FILE_SIZE` (10 MB) grammers switches to
+/// `upload::SaveBigFilePart` over four workers, which a 24.8 MB FLAC hits.
+///
+/// `size` must be the exact byte count of what the reader will yield: it is sent
+/// to Telegram as the document size and used to plan every `upload.getFile`
+/// part on playback.
+/// How long a master upload may stay silent before it is declared hung.
+///
+/// MEASURED 2026-11-10 on the deployed fleet: an upload inside `upload_stream`
+/// never returned. There is no timeout on that future, so the task lived forever
+/// — and with it the process-wide backfill gate (`backfill::FILL_OWNER_SINCE`),
+/// which is why every later query on that dyno answered `a fill is already
+/// running in this process - deferred` for over an hour while nothing streamed.
+///
+/// A floor is required because the first byte of a 50 MB FLAC can take minutes on
+/// a phone link, and a ceiling because a wedged connection must not outlive the
+/// turn. The allowance is deliberately generous (256 KB/s, floor of ten minutes):
+/// this is a liveness backstop against a hang, NOT a bandwidth policy — killing a
+/// slow but working upload would trade a stuck fill for a failed one.
+const UPLOAD_FLOOR_SECS: u64 = 600;
+const UPLOAD_CEILING_SECS: u64 = 1500;
+const UPLOAD_ASSUMED_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// The wall-clock budget for uploading `size` bytes. Pure, so the shape of the
+/// rule is testable without a Telegram connection.
+pub(crate) fn upload_deadline_secs(size: u64) -> u64 {
+    let allowance = size / UPLOAD_ASSUMED_BYTES_PER_SEC;
+    (UPLOAD_FLOOR_SECS + allowance).min(UPLOAD_CEILING_SECS)
+}
+
+pub async fn upload_and_send_audio<S>(
+    client: &Client,
+    peer: PeerRef,
+    source: &mut S,
+    size: u64,
+    file_name: &str,
+    mime: &str,
+    title: &str,
+    performer: &str,
+    duration_secs: i64,
+    // A cover image to attach as the document's thumbnail, already fetched and
+    // already validated as a small JPEG (see `backfill::fetch_thumb`). Without
+    // one the file lands with NO thumb, which is why a filled track showed a
+    // blank square in the player and in `/thumb/{code}`: that route reads the
+    // document's own thumbs from Telegram, so if the send carried none there is
+    // nothing to read.
+    thumb: Option<Vec<u8>>,
+    caption: &str,
+) -> Result<SentDoc, GramErr>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    if size == 0 {
+        return Err(GramErr {
+            message: "upload_and_send_audio: zero size".to_string(),
+            ..Default::default()
+        });
+    }
+
+    // BOUNDED, and the bound is the point: `upload_stream` has no timeout of its
+    // own, so a send that stops making progress parks this task — and the caller's
+    // fill gate — for the life of the process. On the deadline the future is
+    // dropped and the caller gets an error, which releases its lease and lets the
+    // NEXT query try again.
+    let deadline = upload_deadline_secs(size);
+    let uploaded = match tokio::time::timeout(
+        std::time::Duration::from_secs(deadline),
+        client.upload_stream(source, size as usize, file_name.to_string()),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| GramErr {
+            message: format!("upload_stream {file_name}: {e}"),
+            transport: true,
+            ..Default::default()
+        })?,
+        Err(_) => {
+            log(
+                "backfill upload deadline exceeded",
+                &serde_json::json!({"file_name": file_name, "bytes": size, "secs": deadline}),
+            );
+            return Err(GramErr {
+                message: format!(
+                    "upload_stream {file_name}: no completion in {deadline}s — upload abandoned as hung"
+                ),
+                transport: true,
+                ..Default::default()
+            });
+        }
+    };
+
+    let mut media = InputAudio::new(uploaded).mime_type(mime.to_string());
+    // Upload the cover as a document thumb. Failure is not fatal: a track with no
+    // artwork still plays, and losing the whole fill over a 404 on a JPEG would be
+    // the wrong trade.
+    if let Some(bytes) = thumb {
+        if !bytes.is_empty() {
+            let mut cursor = &bytes[..];
+            // A thumbnail is a few hundred KB; 60 s is already absurdly generous
+            // and a hang here must cost the cover, not the whole fill.
+            let thumb_upload = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                client.upload_stream(&mut cursor, bytes.len(), "thumb.jpg".to_string()),
+            )
+            .await;
+            match thumb_upload {
+                Ok(Ok(up)) => media = media.thumb(Some(up)),
+                Ok(Err(e)) => log(
+                    "backfill thumb upload failed",
+                    &serde_json::json!({"error": e.to_string(), "bytes": bytes.len()}),
+                ),
+                Err(_) => log(
+                    "backfill thumb upload failed",
+                    &serde_json::json!({"error": "no completion in 60s", "bytes": bytes.len()}),
+                ),
+            }
+        }
+    }
+    if duration_secs > 0 {
+        media = media.duration(std::time::Duration::from_secs(duration_secs as u64));
+    }
+    if !title.is_empty() {
+        media = media.title(Some(title.to_string()));
+    }
+    if !performer.is_empty() {
+        media = media.performer(Some(performer.to_string()));
+    }
+
+    // A caption with media is how the origin's userbot pool is asked to relay a
+    // file to a bot — see `backfill::REQUEST_CAPTION`. Empty means "no caption",
+    // which is the previous behaviour exactly.
+    let mut outgoing = InputMessage::new().media(media);
+    if !caption.is_empty() {
+        outgoing = outgoing.text(caption.to_string());
+    }
+
+    // The send itself is bounded too: a media message is a single round trip once
+    // the file is uploaded, so two minutes is a hang, not a slow network.
+    let msg = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        client.send_message(peer, outgoing),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| GramErr {
+            message: format!("send_audio {file_name}: {e}"),
+            ..Default::default()
+        })?,
+        Err(_) => {
+            return Err(GramErr {
+                message: format!("send_audio {file_name}: no completion in 120s — send abandoned as hung"),
+                ..Default::default()
+            })
+        }
+    };
+    let message_id = msg.id();
+
+    // The document triple the byte path needs. Taken from the SEND RESULT, never
+    // guessed and never re-resolved: `file_reference` is only valid for the bot
+    // that received it, so this is also the only bot that can play it back.
+    let doc = match msg.media() {
+        Some(Media::Document(m)) => match m.raw.document {
+            Some(tl::enums::Document::Document(d)) => d,
+            _ => {
+                return Err(GramErr {
+                    message: format!("send_audio {file_name}: document empty"),
+                    ..Default::default()
+                })
+            }
+        },
+        _ => {
+            return Err(GramErr {
+                message: format!("send_audio {file_name}: sent media is not a document"),
+                ..Default::default()
+            })
+        }
+    };
+
+    let key = format!("{}_{}_{}", doc.id, doc.access_hash, doc.dc_id);
+    log(
+        "backfill sent",
+        &serde_json::json!({
+            "file_name": file_name,
+            "bytes": doc.size,
+            "message_id": message_id,
+            "dc_id": doc.dc_id,
+        }),
+    );
+
+    Ok(SentDoc {
+        target: DocTarget {
+            dc_id: doc.dc_id,
+            size: doc.size.max(0) as u64,
+            location: tl::enums::InputFileLocation::InputDocumentFileLocation(
+                tl::types::InputDocumentFileLocation {
+                    id: doc.id,
+                    access_hash: doc.access_hash,
+                    file_reference: doc.file_reference,
+                    thumb_size: String::new(),
+                },
+            ),
+        },
+        message_id,
+        key,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -751,7 +1108,25 @@ pub fn map_invocation_error(e: InvocationError) -> GramErr {
                     || rpc.name.contains("FILE_MIGRATE")
                     || rpc.name.contains("AUTH_BYTES"),
                 flood_wait,
-                transport: false,
+                // `-503 Timeout` is Telegram answering "ask again", not a dead
+                // file — and it must be retried by the LIVE BODY, which only
+                // retries what is marked transient.
+                //
+                // MEASURED 2026-11-09, BitChord on `R1kYa6` (TUIDE · SUN KISS):
+                //
+                //   download served by bot            {"range":"bytes=1048576-"}
+                //   download stream aborted mid-body  {"bytes_sent":3145728,
+                //                                      "error":"Timeout (-503)"}
+                //
+                // — and NO `download stream retrying a window` line in between,
+                // because `is_transport_reset()` looks for TCP phrasings
+                // (`reset by peer`, `broken pipe`) and this message is a plain
+                // RPC name. So the body died at 3 MB and the player restarted the
+                // whole track, which is what the user saw as it looping. It is a
+                // transient answer on `upload.getFile` and is classified as one
+                // here so every existing retry path (body window, pre-flight
+                // rotation) handles it.
+                transport: rpc.code == -503,
             }
         }
         other => {
@@ -1081,6 +1456,26 @@ mod tests {
         // A signed-in DC is never rotated: that is the caller's guard, pinned here
         // so nobody "simplifies" it back into the candidate scan.
         assert!(!DC_FALLBACK_IPV4.contains(&own));
+    }
+
+    /// The upload deadline is a LIVENESS backstop, not a bandwidth policy: a
+    /// small file gets the floor (a phone link is slow to start), a large one
+    /// gets a larger allowance, and nothing can exceed the ceiling — a wedged
+    /// connection must not outlive the process like the 2026-11-10 one did.
+    #[test]
+    fn an_upload_deadline_has_a_floor_a_slope_and_a_ceiling() {
+        assert_eq!(upload_deadline_secs(0), UPLOAD_FLOOR_SECS);
+        assert_eq!(upload_deadline_secs(24_805_746), UPLOAD_FLOOR_SECS + 94);
+        assert_eq!(upload_deadline_secs(53_975_130), UPLOAD_FLOOR_SECS + 205);
+        // Bigger never means shorter.
+        let mut last = 0;
+        for mb in [0u64, 1, 10, 25, 50, 100, 400, 4096] {
+            let d = upload_deadline_secs(mb * 1024 * 1024);
+            assert!(d >= last, "{mb} MB got {d}s after {last}s");
+            assert!(d <= UPLOAD_CEILING_SECS, "{mb} MB exceeded the ceiling");
+            last = d;
+        }
+        assert_eq!(upload_deadline_secs(4096 * 1024 * 1024), UPLOAD_CEILING_SECS);
     }
 
     #[test]
